@@ -49,9 +49,9 @@ MIN_DURATION_MS=400
 SILENCE_THRESHOLD_DB=-50
 
 # Push-to-talk: hold this key to record, release to transcribe.
-# Use the xkb key name, e.g. Control_L, Control_R, Alt_R, F9. Empty disables it.
+# Use the xkb key name, e.g. Alt_L, Control_L, Control_R, Alt_R, F9. Empty disables it.
 # Note: Omarchy's own dictation (if a backend is selected) uses ALT + Alt_R.
-PTT_KEY="Control_L"
+PTT_KEY="Alt_L"
 
 # Modifiers that must be held together with PTT_KEY, space-separated
 # (SUPER, CTRL, ALT, SHIFT). Empty for none.

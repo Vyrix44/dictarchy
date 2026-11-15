@@ -3,7 +3,7 @@
 # config, Omarchy shell bar, Omarchy menu). Run "dictarchy help" for an overview.
 set -euo pipefail
 
-readonly VERSION="0.3.0"
+readonly VERSION="0.4.0"
 readonly SELF="$(readlink -f -- "${BASH_SOURCE[0]}")"
 
 # ---------------------------------------------------------------------------
@@ -66,7 +66,7 @@ OUTPUT_MODE="both"
 TRAILING_SPACE="true"
 MIN_DURATION_MS=400
 SILENCE_THRESHOLD_DB=-50
-PTT_KEY="Control_L"
+PTT_KEY="Alt_L"
 PTT_MODS=""
 TOGGLE_KEY="D"
 TOGGLE_MODS="SUPER ALT"
@@ -138,6 +138,7 @@ declare -A MSG_EN=(
   [output_both]="Type and copy to clipboard"
   [output_type]="Type only"
   [output_clipboard]="Clipboard only"
+  [key_Alt_L]="Left Alt - hold"
   [key_Control_L]="Left Ctrl - hold"
   [key_Control_R]="Right Ctrl - hold"
   [key_Alt_R]="Right Alt - hold"
@@ -247,6 +248,7 @@ declare -A MSG_DE=(
   [output_both]="Eintippen und in die Zwischenablage"
   [output_type]="Nur eintippen"
   [output_clipboard]="Nur Zwischenablage"
+  [key_Alt_L]="Alt links – halten"
   [key_Control_L]="Strg links – halten"
   [key_Control_R]="Strg rechts – halten"
   [key_Alt_R]="Alt rechts – halten"
@@ -531,7 +533,7 @@ validate_config() {
   check_value OVERLAY '^(true|false)$' "true"
   check_value MIN_DURATION_MS '^[0-9]+$' "400"
   check_value SILENCE_THRESHOLD_DB '^-?[0-9]+([.][0-9]+)?$' "-50"
-  check_value PTT_KEY '^[A-Za-z0-9_]*$' "Control_L"
+  check_value PTT_KEY '^[A-Za-z0-9_]*$' "Alt_L"
   check_value PTT_MODS '^[A-Z ]*$' ""
   check_value TOGGLE_KEY '^[A-Za-z0-9_]*$' "D"
   check_value TOGGLE_MODS '^[A-Z ]*$' "SUPER ALT"
@@ -1349,7 +1351,7 @@ menu_hotkey() {  # ptt|toggle
   if [[ $which == ptt ]]; then
     title=$(t menu_ptt)
     current=$(combo_label "$PTT_MODS" "$PTT_KEY")
-    presets=(Control_L Control_R Alt_R Super_R F9)
+    presets=(Alt_L Control_L Control_R Alt_R Super_R F9)
     for p in "${presets[@]}"; do
       rows+=("$(row "$ICON_MIC" "$p" "$(mark_current "$p" "$current" "$(t "key_$p")")")")
     done

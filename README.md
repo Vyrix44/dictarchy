@@ -9,8 +9,8 @@ opens the settings and switches the language.
 
 ## Features
 
-- **Push-to-talk** on Left Ctrl by default: hold to record, release to transcribe.
-  Short taps (Ctrl+C and friends) stay silent, and Ctrl keeps working in every app.
+- **Push-to-talk** on Left Alt by default: hold to record, release to transcribe.
+  Short taps (Alt shortcuts and friends) stay silent, and Alt keeps working in every app.
 - **Toggle** on Super+Alt+D by default.
 - **Bar widget** for the Omarchy shell: the dictarchy mark (five voice bars rising to a peak) with
   the language, red while recording, pulsing while transcribing, and "Setup needed" until an API key is saved.
@@ -122,7 +122,7 @@ The settings menu:
 |------------------|--------------|
 | API key          | opens the floating terminal to enter or replace the key |
 | Language         | pick from `LANGUAGES`, or *Other...* for any ISO 639-1 code (added to the list) |
-| Push-to-talk key | Left/Right Ctrl, Right Alt, Right Super, F9, a custom combination, or off |
+| Push-to-talk key | Left Alt, Left/Right Ctrl, Right Alt, Right Super, F9, a custom combination, or off |
 | Toggle key       | Super+Alt+D, a custom combination, or off |
 | Output           | type and copy, type only, or clipboard only |
 | Recording overlay | turn the overlay at the bottom of the screen on or off |
@@ -136,7 +136,7 @@ Omarchy's own dictation (when a backend is selected) uses Alt+Space and Right Al
 
 | Action       | Default        | Behavior |
 |--------------|----------------|----------|
-| Push-to-talk | hold Left Ctrl | Records while held, transcribes on release. The overlay appears only after `MIN_DURATION_MS`. |
+| Push-to-talk | hold Left Alt | Records while held, transcribes on release. The overlay appears only after `MIN_DURATION_MS`. |
 | Toggle       | Super+Alt+D    | Press to start, press again to stop and transcribe. |
 
 The bindings are generated into `~/.config/hypr/dictarchy.lua` with Omarchy's `o.bind_hold` and
@@ -158,7 +158,7 @@ See [`config/config.example`](config/config.example) for the commented defaults.
 | `TRAILING_SPACE` | `true` | Append a space after typed text |
 | `MIN_DURATION_MS` | `400` | Shorter recordings are discarded |
 | `SILENCE_THRESHOLD_DB` | `-50` | Recordings with a lower peak are discarded (ffmpeg) |
-| `PTT_KEY` | `Control_L` | Push-to-talk key; empty disables it |
+| `PTT_KEY` | `Alt_L` | Push-to-talk key; empty disables it |
 | `PTT_MODS` | *(empty)* | Modifiers for the push-to-talk key, e.g. `SUPER` |
 | `TOGGLE_KEY` | `D` | Toggle key; empty disables it |
 | `TOGGLE_MODS` | `SUPER ALT` | Modifiers for the toggle key |

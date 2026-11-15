@@ -745,9 +745,10 @@ reset_env
 check "cancel while idle is a no-op" test "$("$DICT" cancel)" = "Nothing to cancel."
 "$DICT" start --bogus >/dev/null 2>&1
 check "unknown option exits with status 2" test "$?" = "2"
-check "version" test "$("$DICT" version)" = "dictarchy 0.3.0"
+check "version" test "$("$DICT" version)" = "dictarchy 0.4.0"
+check "push-to-talk defaults to Left Alt" test "$("$DICT" status | jq -r .ptt)" = "Alt_L"
 check "help lists the menu" bash -c "'$DICT' help | grep -q 'menu'"
-check "manifest version matches" test "$(jq -r .version "$REPO/manifest.json")" = "0.3.0"
+check "manifest version matches" test "$(jq -r .version "$REPO/manifest.json")" = "0.4.0"
 
 # ---------------------------------------------------------------------------
 echo
