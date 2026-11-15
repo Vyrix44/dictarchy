@@ -3,6 +3,33 @@
 All notable changes to this project are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [0.5.0] - 2026-11-15
+
+### Changed
+
+- The hotkeys are bound in Lua inside the running Hyprland (`hypr/dictarchy.lua`, the approach of
+  [omarchy-window-snap](https://github.com/Vyrix44/omarchy-window-snap)) instead of a generated
+  `~/.config/hypr/dictarchy.lua` loaded from a block in `hyprland.lua`. The plugin's service sets them when
+  the shell starts and after every Hyprland config reload, and removes them when the plugin is disabled or
+  removed. dictarchy no longer writes to the Hyprland config.
+- `omarchy plugin add ... --enable` is a complete install: the first click on the icon only asks for the
+  API key, and "Setup needed" means just that no key is saved. `install.sh` is optional; it adds the
+  `~/.local/bin/dictarchy` link. `omarchy plugin remove` alone leaves nothing behind in Hyprland.
+- Every hotkey replaces what Hyprland had bound to its exact key combination, also a modifier key such as
+  Left Alt (Alt shortcuts keep working). A key change from the menu reloads Hyprland, so that bind comes back.
+- `dictarchy bindings` sets the hotkeys in the running Hyprland and takes `--clear` (remove them) and
+  `--owner` (used by the service).
+
+### Removed
+
+- `install.sh --setup` (still accepted, does a normal install).
+
+### Migration
+
+- On the first run after the update, the CLI deletes `~/.config/hypr/dictarchy.lua` and removes the marked
+  block from `~/.config/hypr/hyprland.lua` (backup: `hyprland.lua.dictarchy-backup-<timestamp>`), then reloads
+  Hyprland once so the old binds go away. `uninstall.sh` removes both as well.
+
 ## [0.4.0] - 2026-11-15
 
 ### Changed

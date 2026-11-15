@@ -25,6 +25,7 @@ export XDG_RUNTIME_DIR="$TMP/run"
 export STUB_LOG="$LOGS"
 export STUB_EXPECT_KEY="$KEY"
 export DICTARCHY_UI_LANG=en
+export HYPRLAND_INSTANCE_SIGNATURE=smoke-test
 export PATH="$STUB_BIN:/usr/bin:/bin"
 
 PASS=0
@@ -99,8 +100,13 @@ EOF
 make_stub hyprctl <<'EOF'
 printf '%s\n' "$*" >> "$STUB_LOG/hyprctl.log"
 case ${1:-} in
-  binds) cat "${STUB_BINDS:-/dev/null}" 2>/dev/null || echo '[]' ;;
+  binds)
+    if [[ ${2:-} == -j ]]; then cat "${STUB_BINDS:-/dev/null}" 2>/dev/null || echo '[]'
+    elif [[ ${STUB_DICTARCHY_BOUND:-0} == 1 ]]; then printf 'bindnd\n\tkey: Alt_L\n\tdescription: Dictarchy: push-to-talk start\n'
+    fi ;;
   configerrors) printf '%s' "${STUB_CONFIG_ERRORS:-}" ;;
+  # The Lua expression, one per line, for tests/smoke.sh's harness to evaluate.
+  dispatch) printf '%s\n' "$2" >> "$STUB_LOG/dispatch.log"; printf '%s\n' "${STUB_DISPATCH_OUTPUT:-ok}" ;;
 esac
 exit 0
 EOF
@@ -167,7 +173,8 @@ CFG_DIR="$XDG_CONFIG_HOME/dictarchy"
 CFG="$CFG_DIR/config"
 RUN_DIR="$TMP/run/dictarchy"
 STATE_LOG="$TMP/state/dictarchy/dictarchy.log"
-BIND_FILE="$XDG_CONFIG_HOME/hypr/dictarchy.lua"
+LEGACY_BIND_FILE="$XDG_CONFIG_HOME/hypr/dictarchy.lua"
+DISPATCH_LOG="$LOGS/dispatch.log"
 
 reset_env() {
   if [[ -f $RUN_DIR/pid ]]; then
@@ -178,7 +185,7 @@ reset_env() {
   rm -rf "$CFG_DIR" "$TMP/state/dictarchy" "$RUN_DIR" "$XDG_CONFIG_HOME/hypr" "$XDG_CONFIG_HOME/omarchy" "$HOME/.local"
   rm -f "$LOGS"/*.log "$LOGS/menu-answers"
   rm -f "$TMP/INJECT_PWNED"
-  unset STUB_HTTP_CODE STUB_BODY STUB_MAX_VOLUME GROQ_API_KEY STUB_BINDS STUB_CONFIG_ERRORS
+  unset STUB_HTTP_CODE STUB_BODY STUB_MAX_VOLUME GROQ_API_KEY STUB_BINDS STUB_CONFIG_ERRORS STUB_DISPATCH_OUTPUT STUB_DICTARCHY_BOUND
   export DICTARCHY_API_KEY="$KEY"
   mkdir -p "$CFG_DIR"
   cd "$TMP" || exit 1
@@ -220,6 +227,15 @@ if command -v shellcheck >/dev/null 2>&1; then
   check "shellcheck" shellcheck -x "$REPO/bin/dictarchy" "$REPO/install.sh" "$REPO/uninstall.sh"
 else
   skip "shellcheck not installed"
+fi
+if command -v luac >/dev/null 2>&1; then
+  check "hypr/dictarchy.lua compiles (luac -p)" luac -p "$REPO/hypr/dictarchy.lua"
+fi
+LUA=$(command -v lua || command -v luajit || true)
+if [[ -n $LUA ]]; then
+  check "hotkey engine unit tests (tests/hotkeys_test.lua)" bash -c "cd '$REPO' && '$LUA' tests/hotkeys_test.lua"
+else
+  skip "lua not installed (hotkey engine tests)"
 fi
 for json in "$REPO/manifest.json" "$REPO/i18n/"*.json; do
   check "valid JSON: ${json#"$REPO/"}" jq -e . "$json"
@@ -463,83 +479,160 @@ env -u DICTARCHY_UI_LANG "$DICT" lang fr >/dev/null
 check "German UI is read from ~/.config/omarchy/language" grep -q 'Sprache: FR' "$LOGS/notify.log"
 
 # ---------------------------------------------------------------------------
-echo "== Hyprland bindings (Lua)"
+echo "== Hyprland hotkeys (Lua, set over hyprctl dispatch)"
 # ---------------------------------------------------------------------------
-# Loads a generated bindings file with stubbed o.* and prints one line per bind.
+# Evaluates the dispatched expressions like Hyprland does, against the real
+# hypr/dictarchy.lua and a stub hl, and prints one line per hl call, then
+# "final|<number of binds left>". A bind handle must never be used.
 cat > "$TMP/harness.lua" <<'EOF'
-local out = {}
-o = {}
-hl = { unbind = function(keys) table.insert(out, "unbind|" .. keys) end }
+local out, last, binds = {}, nil, {}
 local function opts_string(t)
   local keys = {}
-  for k, v in pairs(t or {}) do table.insert(keys, k .. "=" .. tostring(v)) end
+  for k, v in pairs(t or {}) do
+    if k ~= "description" then table.insert(keys, k .. "=" .. tostring(v)) end
+  end
   table.sort(keys)
   return table.concat(keys, ",")
 end
-function o.bind_hold(keys, d1, press, d2, release, opts)
-  table.insert(out, table.concat({ "hold", keys, d1, press, d2, release, opts_string(opts) }, "|"))
+hl = {
+  dsp = { exec_cmd = function(cmd) return { exec = cmd } end },
+  exec_cmd = function(cmd) last = cmd end,
+  unbind = function(keys)
+    table.insert(out, "unbind|" .. keys)
+    for i = #binds, 1, -1 do if binds[i] == keys then table.remove(binds, i) end end
+  end,
+  bind = function(keys, handler, opts)
+    local cmd
+    if type(handler) == "function" then
+      last = nil; handler(); cmd = last or "-"  -- press runs before its release
+    else
+      cmd = handler.exec
+    end
+    table.insert(out, table.concat({ "bind", keys, opts.description or "", cmd, opts_string(opts) }, "|"))
+    table.insert(binds, keys)
+    return setmetatable({}, { __index = function() error("bind handle used") end })
+  end,
+}
+for line in io.lines(arg[1]) do
+  local chunk, err = load("return " .. line)
+  if not chunk then
+    table.insert(out, "syntax|" .. err)
+  else
+    local ok, result = pcall(chunk)
+    if not ok then table.insert(out, "error|" .. tostring(result))
+    elseif type(result) ~= "table" or result.exec ~= "true" then table.insert(out, "nodispatcher") end
+  end
 end
-function o.rebind(keys, d, cmd, opts)
-  table.insert(out, table.concat({ "rebind", keys, d, cmd, opts_string(opts) }, "|"))
-end
-dofile(arg[1])
 for _, line in ipairs(out) do print(line) end
+print("final|" .. #binds)
 EOF
-LUA=$(command -v lua || command -v luajit || true)
+binds_of_dispatch() {  # prints the hl calls of every dispatched expression so far
+  "$LUA" "$TMP/harness.lua" "$DISPATCH_LOG"
+}
 
-reset_env
-write_config <<'EOF'
+if [[ -z $LUA ]]; then
+  skip "lua not installed (hotkey harness)"
+else
+  reset_env
+  write_config <<'EOF'
 PTT_KEY=Control_L
 PTT_MODS=""
 TOGGLE_KEY=D
 TOGGLE_MODS="SUPER ALT"
 EOF
-"$DICT" bindings >/dev/null
-check "bindings file is written" test -f "$BIND_FILE"
-check "bindings header marks the file as managed" grep -q '^-- Managed by dictarchy' "$BIND_FILE"
-check "hyprctl reload and configerrors were called" bash -c "grep -qx reload '$LOGS/hyprctl.log' && grep -qx configerrors '$LOGS/hyprctl.log'"
-if command -v luac >/dev/null 2>&1; then
-  check "bindings file is valid Lua (luac -p)" luac -p "$BIND_FILE"
-fi
-if [[ -n $LUA ]]; then
-  "$LUA" "$TMP/harness.lua" "$BIND_FILE" > "$TMP/binds.txt"
-  check "push-to-talk: bind_hold on Control_L, non-consuming, any modifiers" \
-    grep -qxF "hold|Control_L|Dictarchy: push-to-talk start|$DICT_REAL start --ptt|Dictarchy: push-to-talk stop|$DICT_REAL stop --ptt|ignore_mods=true,non_consuming=true" "$TMP/binds.txt"
-  check "toggle: rebind SUPER + ALT + D" \
-    grep -qxF "rebind|SUPER + ALT + D|Dictarchy: toggle dictation|$DICT_REAL toggle|" "$TMP/binds.txt"
-else
-  skip "lua not installed"
-fi
+  "$DICT" bindings --owner tok123 >/dev/null
+  check "bindings: exits successfully" test "$?" = "0"
+  check "bindings: one hyprctl dispatch, no reload" bash -c "test \$(wc -l < '$DISPATCH_LOG') = 1 && ! grep -qx reload '$LOGS/hyprctl.log'"
+  check "bindings: the Hyprland config is not touched" test ! -e "$XDG_CONFIG_HOME/hypr"
+  check "bindings: the service's token is passed as owner" grep -qF 'dictarchy_hotkeys.apply("tok123", ' "$DISPATCH_LOG"
+  binds_of_dispatch > "$TMP/binds.txt"
+  check "bindings: the expression runs and yields a dispatcher" bash -c "! grep -qE '^(syntax|error|nodispatcher)' '$TMP/binds.txt'"
+  check "push-to-talk press on Control_L: non-consuming, any modifiers" \
+    grep -qxF "bind|Control_L|Dictarchy: push-to-talk start|$DICT_REAL start --ptt|ignore_mods=true,non_consuming=true" "$TMP/binds.txt"
+  check "push-to-talk release: transparent release bind" \
+    grep -qxF "bind|Control_L|Dictarchy: push-to-talk stop|$DICT_REAL stop --ptt|ignore_mods=true,non_consuming=true,release=true,transparent=true" "$TMP/binds.txt"
+  check "toggle on SUPER + ALT + D replaces an existing bind" \
+    bash -c "grep -qxF 'unbind|SUPER + ALT + D' '$TMP/binds.txt' && grep -qxF 'bind|SUPER + ALT + D|Dictarchy: toggle dictation|$DICT_REAL toggle|' '$TMP/binds.txt'"
+  check "every combination is cleared before it is bound" grep -qxF 'unbind|Control_L' "$TMP/binds.txt"
+  check "no dictarchy binds in Hyprland (a reload): applied as fresh" grep -qF '} }, true);' "$DISPATCH_LOG"
 
-reset_env
-write_config <<'EOF'
+  STUB_DICTARCHY_BOUND=1 "$DICT" bindings >/dev/null
+  binds_of_dispatch > "$TMP/binds.txt"
+  check "dictarchy binds present: applied as not fresh" bash -c "tail -n 1 '$DISPATCH_LOG' | grep -qF '} }, false);'"
+  check "applying again leaves exactly three binds" grep -qx 'final|3' "$TMP/binds.txt"
+  check "a menu-style apply keeps the owner (nil)" grep -qF 'dictarchy_hotkeys.apply(nil, ' "$DISPATCH_LOG"
+  "$DICT" bindings --clear >/dev/null
+  binds_of_dispatch > "$TMP/binds.txt"
+  check "bindings --clear removes them" grep -qx 'final|0' "$TMP/binds.txt"
+
+  reset_env
+  write_config <<'EOF'
 PTT_KEY=F9
 PTT_MODS="SUPER"
 TOGGLE_KEY=""
 EOF
-"$DICT" bindings >/dev/null
-if [[ -n $LUA ]]; then
-  "$LUA" "$TMP/harness.lua" "$BIND_FILE" > "$TMP/binds.txt"
-  check "non-modifier push-to-talk key: consuming, replaces an existing bind" \
-    bash -c "grep -qxF 'unbind|SUPER + F9' '$TMP/binds.txt' && grep -q '^hold|SUPER + F9|.*|$' '$TMP/binds.txt'"
-  check "empty TOGGLE_KEY produces no toggle bind" bash -c "! grep -q '^rebind' '$TMP/binds.txt'"
+  "$DICT" bindings >/dev/null
+  binds_of_dispatch > "$TMP/binds.txt"
+  check "ordinary push-to-talk key: consuming, replaces an existing bind" \
+    bash -c "grep -qxF 'unbind|SUPER + F9' '$TMP/binds.txt' && grep -qxF 'bind|SUPER + F9|Dictarchy: push-to-talk start|$DICT_REAL start --ptt|' '$TMP/binds.txt'"
+  check "empty TOGGLE_KEY produces no toggle bind" bash -c "! grep -q 'toggle dictation' '$TMP/binds.txt'"
+
+  reset_env
+  mkdir -p "$TMP/weird dir/plug\"in"
+  cp -r "$REPO/bin" "$REPO/hypr" "$TMP/weird dir/plug\"in/"
+  WEIRD="$TMP/weird dir/plug\"in/bin/dictarchy"
+  "$WEIRD" bindings >/dev/null
+  binds_of_dispatch > "$TMP/binds.txt"
+  check "odd install paths: engine path and command are quoted for Lua and the shell" \
+    bash -c "! grep -qE '^(syntax|error)' '$TMP/binds.txt' && grep -qF '|$(printf '%q' "$WEIRD") toggle|' '$TMP/binds.txt'"
 fi
 
 reset_env
-mkdir -p "$TMP/weird dir"
-cp "$DICT" "$TMP/weird dir/dict\"archy"
-"$TMP/weird dir/dict\"archy" bindings >/dev/null
-if [[ -n $LUA ]]; then
-  "$LUA" "$TMP/harness.lua" "$BIND_FILE" > "$TMP/binds.txt"
-  check "odd install paths are quoted for Lua and the shell" \
-    grep -qF "|$(printf '%q' "$TMP/weird dir/dict\"archy") toggle|" "$TMP/binds.txt"
-fi
-
-reset_env
-export STUB_CONFIG_ERRORS="dictarchy.lua:3: boom"
+export STUB_DISPATCH_OUTPUT="dictarchy: cannot bind Foo: no such key"
 "$DICT" bindings >/dev/null 2>&1
-check "config errors after reload are reported" test "$?" != "0"
-check "config errors are logged" grep -q 'hyprland config errors' "$STATE_LOG"
+check "an error from Hyprland fails the command" test "$?" != "0"
+check "the error is logged" grep -q 'hotkeys not applied: dictarchy: cannot bind Foo' "$STATE_LOG"
+check "the error is shown" grep -q 'did not take the dictarchy hotkeys' "$LOGS/notify.log"
+unset STUB_DISPATCH_OUTPUT
+
+reset_env
+HYPRLAND_INSTANCE_SIGNATURE="" "$DICT" bindings >/dev/null 2>&1
+check "without Hyprland: fails quietly, no dispatch" bash -c "test $? != 0 && test ! -e '$DISPATCH_LOG' && test ! -e '$LOGS/notify.log'"
+
+# ---------------------------------------------------------------------------
+echo "== migration from the hyprland.lua block (dictarchy 0.4 and older)"
+# ---------------------------------------------------------------------------
+reset_env
+mkdir -p "$XDG_CONFIG_HOME/hypr"
+printf '%s\n' 'require("hypr.bindings")' '-- my own line' > "$TMP/hyprland.orig"
+{
+  cat "$TMP/hyprland.orig"
+  printf '%s\n' '' '-- >>> dictarchy >>>' '-- Managed by dictarchy (install.sh / uninstall.sh) - do not edit between these markers.' \
+    'do' '  require("hypr.dictarchy")' 'end' '-- <<< dictarchy <<<'
+} > "$XDG_CONFIG_HOME/hypr/hyprland.lua"
+printf '%s\n' '-- Managed by dictarchy - this file is overwritten.' 'o.rebind("SUPER + ALT + D", "x", "y")' > "$LEGACY_BIND_FILE"
+"$DICT" bindings >/dev/null 2>&1
+check "migration: the block is removed, hyprland.lua is back to the original" cmp -s "$XDG_CONFIG_HOME/hypr/hyprland.lua" "$TMP/hyprland.orig"
+check "migration: hyprland.lua was backed up" bash -c "compgen -G '$XDG_CONFIG_HOME/hypr/hyprland.lua.dictarchy-backup-*' >/dev/null"
+check "migration: the generated dictarchy.lua is deleted" test ! -e "$LEGACY_BIND_FILE"
+check "migration: Hyprland reloads before the hotkeys are set" \
+  bash -c "test \"\$(grep -m1 -nx reload '$LOGS/hyprctl.log' | cut -d: -f1)\" -lt \"\$(grep -m1 -n '^dispatch' '$LOGS/hyprctl.log' | cut -d: -f1)\""
+rm -f "$LOGS/hyprctl.log"
+"$DICT" bindings >/dev/null 2>&1
+check "migration runs once: no reload afterwards" bash -c "! grep -qx reload '$LOGS/hyprctl.log'"
+
+reset_env
+mkdir -p "$XDG_CONFIG_HOME/hypr"
+printf '%s\n' 'require("hypr.bindings")' '-- >>> dictarchy >>>' 'broken, no end marker' > "$XDG_CONFIG_HOME/hypr/hyprland.lua"
+cp "$XDG_CONFIG_HOME/hypr/hyprland.lua" "$TMP/hyprland.orig"
+"$DICT" bindings >/dev/null 2>&1
+check "migration: a block without its end marker is left alone" cmp -s "$XDG_CONFIG_HOME/hypr/hyprland.lua" "$TMP/hyprland.orig"
+
+reset_env
+mkdir -p "$XDG_CONFIG_HOME/hypr"
+echo '-- my own dictarchy.lua' > "$LEGACY_BIND_FILE"
+"$DICT" bindings >/dev/null 2>&1
+check "migration: a dictarchy.lua not written by dictarchy is kept" test -e "$LEGACY_BIND_FILE"
 
 # ---------------------------------------------------------------------------
 echo "== settings menu (stubbed omarchy-menu-select)"
@@ -568,7 +661,22 @@ reset_env
 menu_answers "Push-to-talk key" "Control_R"
 "$DICT" menu
 check "menu: push-to-talk key saved" grep -qxF 'PTT_KEY="Control_R"' "$CFG"
-check "menu: bindings regenerated" grep -q '"Control_R"' "$BIND_FILE"
+check "menu: hotkeys set again" grep -qF 'key = "Control_R"' "$DISPATCH_LOG"
+check "menu: a changed key reloads Hyprland first, so whatever it replaced comes back" grep -qx reload "$LOGS/hyprctl.log"
+
+reset_env
+write_config <<'EOF'
+PTT_KEY=""
+EOF
+menu_answers "Push-to-talk key" "Control_R"
+"$DICT" menu
+check "menu: no reload when the key was off before" bash -c "! grep -qx reload '$LOGS/hyprctl.log'"
+
+reset_env
+menu_answers "Toggle key" "Other..." "SUPER + F10"
+"$DICT" menu
+check "menu: changing the toggle reloads Hyprland, so the bind it replaced comes back" \
+  bash -c "grep -qx reload '$LOGS/hyprctl.log' && grep -qF 'key = \"F10\"' '$DISPATCH_LOG'"
 
 reset_env
 menu_answers "Toggle key" "Other..." "super+shift+r"
@@ -662,12 +770,11 @@ check "install: config created" test -f "$CFG"
 PLUGIN_DIR="$XDG_CONFIG_HOME/omarchy/plugins/io.github.vyrix44.dictarchy"
 check "install: widget copied" bash -c "test -f '$PLUGIN_DIR/manifest.json' && test -f '$PLUGIN_DIR/BarWidget.qml' && test -f '$PLUGIN_DIR/i18n/de.json'"
 check "install: widget contains no symlinks" test -z "$(find "$PLUGIN_DIR" -type l)"
-check "install: hyprland.lua backed up" bash -c "compgen -G '$XDG_CONFIG_HOME/hypr/hyprland.lua.dictarchy-backup-*' >/dev/null"
-check "install: marker block added" bash -c "grep -qxF -- '-- >>> dictarchy >>>' '$XDG_CONFIG_HOME/hypr/hyprland.lua' && grep -qxF -- '-- <<< dictarchy <<<' '$XDG_CONFIG_HOME/hypr/hyprland.lua'"
-if command -v luac >/dev/null 2>&1; then
-  check "install: hyprland.lua is still valid Lua" luac -p "$XDG_CONFIG_HOME/hypr/hyprland.lua"
-fi
-check "install: dictarchy.lua generated" test -f "$BIND_FILE"
+check "install: widget includes the hotkey engine" test -f "$PLUGIN_DIR/hypr/dictarchy.lua"
+check "install: hyprland.lua is not touched" cmp -s "$XDG_CONFIG_HOME/hypr/hyprland.lua" "$TMP/hyprland.orig"
+check "install: no dictarchy.lua in the Hyprland config" test ! -e "$LEGACY_BIND_FILE"
+check "install: hotkeys set in the running Hyprland from the plugin folder" \
+  grep -qF "dofile(\"$PLUGIN_DIR/hypr/dictarchy.lua\")" "$DISPATCH_LOG"
 check "install: shell.json backed up" bash -c "compgen -G '$XDG_CONFIG_HOME/omarchy/shell.json.dictarchy-backup-*' >/dev/null"
 check "install: widget placed left of omarchy.audio" \
   test "$(jq -c '[.bar.layout.right[].id]' "$XDG_CONFIG_HOME/omarchy/shell.json")" = '["omarchy.tray","io.github.vyrix44.dictarchy","omarchy.audio","omarchy.power"]'
@@ -676,7 +783,7 @@ check "install: the rest of shell.json is unchanged" \
 check "install: status starts as 'setup'" test "$("$HOME/.local/bin/dictarchy" status | jq -r .state)" = "setup"
 
 "$REPO/install.sh" </dev/null > "$TMP/install-out2.txt" 2>&1
-check "install again: still exactly one marker block" test "$(grep -cxF -- '-- >>> dictarchy >>>' "$XDG_CONFIG_HOME/hypr/hyprland.lua")" = "1"
+check "install again: hyprland.lua still untouched" cmp -s "$XDG_CONFIG_HOME/hypr/hyprland.lua" "$TMP/hyprland.orig"
 check "install again: no shell restart when the widget files are the same" test ! -e "$LOGS/restart-shell.log"
 rm -f "$PLUGIN_DIR/Service.qml"   # an older install without the overlay service
 STUB_SHELL_UP=1 "$REPO/install.sh" </dev/null >/dev/null 2>&1
@@ -688,9 +795,31 @@ check "uninstall: exits successfully" test "$?" = "0"
 check "uninstall: hyprland.lua is back to the original" cmp -s "$XDG_CONFIG_HOME/hypr/hyprland.lua" "$TMP/hyprland.orig"
 check "uninstall: shell.json is back to the original" \
   test "$(jq -S . "$XDG_CONFIG_HOME/omarchy/shell.json")" = "$(jq -S . "$TMP/shell.orig")"
-check "uninstall: widget, bindings and binary removed" \
-  bash -c "test ! -e '$PLUGIN_DIR' && test ! -e '$BIND_FILE' && test ! -e '$HOME/.local/bin/dictarchy'"
+check "uninstall: widget and binary removed" \
+  bash -c "test ! -e '$PLUGIN_DIR' && test ! -e '$HOME/.local/bin/dictarchy'"
+check "uninstall: hotkeys removed from the running Hyprland" bash -c "tail -n 1 '$DISPATCH_LOG' | grep -qF 'dictarchy_hotkeys.clear()'"
+check "uninstall: no Hyprland reload needed" bash -c "! grep -qx reload '$LOGS/hyprctl.log'"
 check "uninstall --yes keeps the config" test -f "$CFG"
+
+# An install from dictarchy 0.4: uninstall.sh also removes its hyprland.lua block.
+reset_env
+mkdir -p "$XDG_CONFIG_HOME/hypr" "$XDG_CONFIG_HOME/omarchy"
+echo 'require("hypr.bindings")' > "$TMP/hyprland.orig"
+{ cat "$TMP/hyprland.orig"; printf '%s\n' '' '-- >>> dictarchy >>>' 'do end' '-- <<< dictarchy <<<'; } > "$XDG_CONFIG_HOME/hypr/hyprland.lua"
+echo '-- Managed by dictarchy - this file is overwritten.' > "$LEGACY_BIND_FILE"
+"$REPO/uninstall.sh" --yes > "$TMP/uninstall-old.txt" 2>&1
+check "uninstall (0.4 install): block removed, hyprland.lua is back to the original" cmp -s "$XDG_CONFIG_HOME/hypr/hyprland.lua" "$TMP/hyprland.orig"
+check "uninstall (0.4 install): dictarchy.lua removed and Hyprland reloaded" \
+  bash -c "test ! -e '$LEGACY_BIND_FILE' && grep -qx reload '$LOGS/hyprctl.log'"
+
+# An install from dictarchy 0.4 upgraded with install.sh.
+reset_env
+mkdir -p "$XDG_CONFIG_HOME/hypr" "$XDG_CONFIG_HOME/omarchy"
+{ cat "$TMP/hyprland.orig"; printf '%s\n' '' '-- >>> dictarchy >>>' 'do end' '-- <<< dictarchy <<<'; } > "$XDG_CONFIG_HOME/hypr/hyprland.lua"
+echo '-- Managed by dictarchy - this file is overwritten.' > "$LEGACY_BIND_FILE"
+"$REPO/install.sh" </dev/null > "$TMP/install-upgrade.txt" 2>&1
+check "install over 0.4: block and dictarchy.lua removed" \
+  bash -c "cmp -s '$XDG_CONFIG_HOME/hypr/hyprland.lua' '$TMP/hyprland.orig' && test ! -e '$LEGACY_BIND_FILE'"
 
 reset_env
 mkdir -p "$XDG_CONFIG_HOME/hypr" "$XDG_CONFIG_HOME/omarchy"
@@ -714,23 +843,32 @@ mkdir -p "$XDG_CONFIG_HOME/hypr" "$XDG_CONFIG_HOME/omarchy/plugins"
 echo 'require("hypr.bindings")' > "$XDG_CONFIG_HOME/hypr/hyprland.lua"
 echo '{"bar":{"layout":{"right":[{"id":"omarchy.audio"}]}},"version":1}' > "$XDG_CONFIG_HOME/omarchy/shell.json"
 PLUGIN_DIR="$XDG_CONFIG_HOME/omarchy/plugins/io.github.vyrix44.dictarchy"
-# What "omarchy plugin add" leaves behind: the working tree plus .git.
+# What "omarchy plugin add" leaves behind: the working tree plus .git. (A git
+# worktree has a .git file, so it is replaced by a directory.)
 cp -r "$REPO" "$PLUGIN_DIR"
+rm -rf "$PLUGIN_DIR/.git"
 mkdir -p "$PLUGIN_DIR/.git"
+cp "$XDG_CONFIG_HOME/hypr/hyprland.lua" "$TMP/hyprland.orig"
 check "the repository root passes omarchy plugin validate" omarchy-plugin-validate "$PLUGIN_DIR"
 PDICT="$PLUGIN_DIR/bin/dictarchy"
-check "plugin added: status is 'setup' although a key is set (no hotkeys yet)" \
-  test "$("$PDICT" status | jq -r .state)" = "setup"
+# What the plugin's service runs when the shell loads it.
+"$PDICT" bindings --owner svc1 >/dev/null 2>&1
+check "plugin added: the service sets the hotkeys with the plugin's command" \
+  bash -c "grep -qF 'dictarchy_hotkeys.apply(\"svc1\"' '$DISPATCH_LOG' && grep -qF '$PDICT' '$DISPATCH_LOG'"
+check "plugin added: hyprland.lua untouched" cmp -s "$XDG_CONFIG_HOME/hypr/hyprland.lua" "$TMP/hyprland.orig"
+check "plugin added: with a key the status is 'idle' (no setup step)" test "$("$PDICT" status | jq -r .state)" = "idle"
+unset DICTARCHY_API_KEY
+check "plugin added: without a key the status is 'setup'" test "$("$PDICT" status | jq -r .state)" = "setup"
 "$PDICT" setup </dev/null; wait_for "$LOGS/terminal.log"
-check "setup click runs install.sh --setup in a floating terminal" \
-  grep -qF -- "-e $PLUGIN_DIR/install.sh --setup" "$LOGS/terminal.log"
-"$PLUGIN_DIR/install.sh" --setup </dev/null > "$TMP/install-plugin.txt" 2>&1
+check "setup click asks for the API key in a floating terminal" grep -qF -- "-e $PDICT key" "$LOGS/terminal.log"
+export DICTARCHY_API_KEY="$KEY"
+"$PLUGIN_DIR/install.sh" </dev/null > "$TMP/install-plugin.txt" 2>&1
 check "install.sh from the plugin folder: exits successfully" test "$?" = "0"
 check "install.sh from the plugin folder: keeps the git checkout" test -d "$PLUGIN_DIR/.git"
 check "install.sh from the plugin folder: ~/.local/bin/dictarchy links to it" \
   test "$(readlink "$HOME/.local/bin/dictarchy")" = "$PDICT"
-check "install.sh from the plugin folder: hotkeys call the plugin's command" grep -qF "$PDICT" "$BIND_FILE"
-check "after setup: status is no longer 'setup'" test "$("$PDICT" status | jq -r .state)" = "idle"
+"$PLUGIN_DIR/install.sh" --setup </dev/null >/dev/null 2>&1
+check "install.sh still accepts --setup (older widgets)" test "$?" = "0"
 "$REPO/install.sh" </dev/null > "$TMP/install-over-git.txt" 2>&1
 check "install.sh from another checkout leaves a git-managed plugin alone" \
   bash -c "test -d '$PLUGIN_DIR/.git' && grep -q 'managed by omarchy plugin' '$TMP/install-over-git.txt'"
@@ -745,10 +883,10 @@ reset_env
 check "cancel while idle is a no-op" test "$("$DICT" cancel)" = "Nothing to cancel."
 "$DICT" start --bogus >/dev/null 2>&1
 check "unknown option exits with status 2" test "$?" = "2"
-check "version" test "$("$DICT" version)" = "dictarchy 0.4.0"
+check "version" test "$("$DICT" version)" = "dictarchy 0.5.0"
 check "push-to-talk defaults to Left Alt" test "$("$DICT" status | jq -r .ptt)" = "Alt_L"
 check "help lists the menu" bash -c "'$DICT' help | grep -q 'menu'"
-check "manifest version matches" test "$(jq -r .version "$REPO/manifest.json")" = "0.4.0"
+check "manifest version matches" test "$(jq -r .version "$REPO/manifest.json")" = "0.5.0"
 
 # ---------------------------------------------------------------------------
 echo

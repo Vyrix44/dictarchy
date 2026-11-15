@@ -1,5 +1,6 @@
 import QtQuick
 import Quickshell
+import Quickshell.Hyprland
 import Quickshell.Io
 import Quickshell.Services.Pipewire
 import Quickshell.Wayland
@@ -8,11 +9,19 @@ import qs.Commons as Commons
 import qs.Ui
 import "StatusModel.js" as StatusModel
 
-// dictarchy recording overlay: a small card at the bottom of the focused
-// monitor while dictation is running.
+// dictarchy service: the hotkeys and the recording overlay.
+//
+// Hotkeys: the push-to-talk and toggle binds live inside Hyprland's Lua state
+// (hypr/dictarchy.lua), so the user's Hyprland config is never edited. This
+// service has the CLI set them when it starts and again after every Hyprland
+// config reload, which drops them, and removes them when the plugin is disabled
+// or removed. A token identifies this instance, so a stop from an old instance
+// (a shell reload) can't remove the binds a newer one set.
+//
+// Overlay: a small card at the bottom of the focused monitor while dictation
+// is running.
 //   recording     red dot and a scrolling waveform of the live microphone level
 //   transcribing  the bars run as a wave until the text arrives
-//
 // It reads the same status file as the bar widget, so push-to-talk taps shorter
 // than MIN_DURATION_MS never show it. The surface takes no input and no keyboard
 // focus, like Omarchy's own OSD. Turn it off with OVERLAY="false" in
@@ -22,6 +31,53 @@ Item {
 
   property var shell: null
   property var manifest: null
+
+  // ── Hotkeys ──
+  readonly property string command: {
+    var url = String(Qt.resolvedUrl("bin/dictarchy"))
+    return url.indexOf("file://") === 0 ? decodeURIComponent(url.slice(7)) : ""
+  }
+  readonly property string token: Date.now().toString(36) + Math.floor(Math.random() * 1e9).toString(36)
+  property bool hotkeysPending: false
+
+  function applyHotkeys() {
+    if (command === "") return
+    if (hotkeys.running) hotkeysPending = true
+    else hotkeys.running = true
+  }
+
+  function clearHotkeys() {
+    // Inline rather than through the CLI: the service may be going away with
+    // the plugin folder. The token is base36, safe inside a Lua string.
+    Quickshell.execDetached(["hyprctl", "dispatch",
+      "(function() if dictarchy_hotkeys then dictarchy_hotkeys.clear('" + token + "') end return hl.dsp.exec_cmd('true') end)()"])
+  }
+
+  Process {
+    id: hotkeys
+    command: [root.command, "bindings", "--owner", root.token]
+    stderr: StdioCollector {
+      onStreamFinished: if (text.trim()) console.warn("[dictarchy] " + text.trim())
+    }
+    onExited: function(exitCode, exitStatus) {
+      // A reload that came in while applying gets its own run.
+      if (root.hotkeysPending) {
+        root.hotkeysPending = false
+        root.applyHotkeys()
+      }
+    }
+  }
+
+  Connections {
+    target: Hyprland
+    function onRawEvent(event) {
+      if (event && String(event.name) === "configreloaded") root.applyHotkeys()
+    }
+  }
+
+  Component.onDestruction: clearHotkeys()
+
+  // ── Overlay ──
 
   readonly property string runtimeDir: Quickshell.env("XDG_RUNTIME_DIR") || ""
   readonly property string statusPath: runtimeDir !== "" ? runtimeDir + "/dictarchy/status.json" : ""
@@ -57,7 +113,10 @@ Item {
     enabledByConfig = data.overlay
   }
 
-  Component.onCompleted: resetLevels()
+  Component.onCompleted: {
+    resetLevels()
+    applyHotkeys()
+  }
 
   FileView {
     path: root.statusPath

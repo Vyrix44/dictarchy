@@ -2,7 +2,7 @@
   "schemaVersion": 1,
   "id": "io.github.vyrix44.dictarchy",
   "name": "dictarchy",
-  "version": "0.4.0",
+  "version": "0.5.0",
   "author": "Vyrix44",
   "license": "MIT",
   "description": "Speech-to-text via the Groq API: push-to-talk and toggle dictation, with a bar icon for status, language and settings, and a recording overlay at the bottom of the screen.",
