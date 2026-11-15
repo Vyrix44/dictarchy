@@ -1,0 +1,22 @@
+{
+  "schemaVersion": 1,
+  "id": "io.github.vyrix44.dictarchy",
+  "name": "dictarchy",
+  "version": "0.2.0",
+  "author": "Vyrix44",
+  "license": "MIT",
+  "description": "Speech-to-text via the Groq API: push-to-talk and toggle dictation, with a bar icon for status, language and settings.",
+  "kinds": [
+    "bar-widget"
+  ],
+  "entryPoints": {
+    "barWidget": "BarWidget.qml"
+  },
+  "barWidget": {
+    "displayName": "dictarchy",
+    "description": "Dictation status. Left-click: start/stop or set up, right-click: settings, scroll: language",
+    "category": "Audio",
+    "defaultSection": "right",
+    "allowMultiple": false
+  }
+}
