@@ -5,12 +5,15 @@
   "version": "0.2.0",
   "author": "Vyrix44",
   "license": "MIT",
-  "description": "Speech-to-text via the Groq API: push-to-talk and toggle dictation, with a bar icon for status, language and settings.",
+  "description": "Speech-to-text via the Groq API: push-to-talk and toggle dictation, with a bar icon for status, language and settings, and a recording overlay at the bottom of the screen.",
   "kinds": [
-    "bar-widget"
+    "bar-widget",
+    "service"
   ],
+  "keepLoaded": true,
   "entryPoints": {
-    "barWidget": "BarWidget.qml"
+    "barWidget": "BarWidget.qml",
+    "service": "Service.qml"
   },
   "barWidget": {
     "displayName": "dictarchy",

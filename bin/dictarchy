@@ -49,7 +49,7 @@ readonly TEST_RECORD_SECONDS=4      # length of the sample recorded by "dictarch
 # ---------------------------------------------------------------------------
 readonly -a CONFIG_KEYS=(
   API_BASE_URL MODEL LANGUAGE LANGUAGES PROMPT OUTPUT_MODE TRAILING_SPACE
-  MIN_DURATION_MS SILENCE_THRESHOLD_DB PTT_KEY PTT_MODS TOGGLE_KEY TOGGLE_MODS NOTIFY
+  MIN_DURATION_MS SILENCE_THRESHOLD_DB PTT_KEY PTT_MODS TOGGLE_KEY TOGGLE_MODS NOTIFY OVERLAY
 )
 readonly -a DEPRECATED_KEYS=(WAYBAR_SIGNAL)   # accepted silently from 0.1 configs
 API_BASE_URL="https://api.groq.com/openai/v1"
@@ -66,6 +66,7 @@ PTT_MODS=""
 TOGGLE_KEY="D"
 TOGGLE_MODS="SUPER ALT"
 NOTIFY="true"
+OVERLAY="true"
 
 API_KEY=""        # filled by resolve_api_key, never printed or logged
 PTT_MODE=0        # set by parse_ptt_flag
@@ -117,6 +118,10 @@ declare -A MSG_EN=(
   [menu_ptt]="Push-to-talk key"
   [menu_toggle]="Toggle key"
   [menu_output]="Output"
+  [menu_overlay]="Recording overlay"
+  [overlay_true]="on - shown at the bottom of the screen"
+  [overlay_false]="off"
+  [overlay_set]="Recording overlay: %s"
   [menu_test]="Test"
   [menu_test_sub]="Check the setup and transcribe a short sample"
   [menu_log]="Log"
@@ -221,6 +226,10 @@ declare -A MSG_DE=(
   [menu_ptt]="Push-to-Talk-Taste"
   [menu_toggle]="Toggle-Taste"
   [menu_output]="Ausgabe"
+  [menu_overlay]="Aufnahme-Overlay"
+  [overlay_true]="an – unten am Bildschirm"
+  [overlay_false]="aus"
+  [overlay_set]="Aufnahme-Overlay: %s"
   [menu_test]="Test"
   [menu_test_sub]="Einrichtung prüfen und eine kurze Probe transkribieren"
   [menu_log]="Log"
@@ -512,6 +521,7 @@ validate_config() {
   check_value OUTPUT_MODE '^(both|type|clipboard)$' "both"
   check_value TRAILING_SPACE '^(true|false)$' "true"
   check_value NOTIFY '^(true|false)$' "true"
+  check_value OVERLAY '^(true|false)$' "true"
   check_value MIN_DURATION_MS '^[0-9]+$' "400"
   check_value SILENCE_THRESHOLD_DB '^-?[0-9]+([.][0-9]+)?$' "-50"
   check_value PTT_KEY '^[A-Za-z0-9_]*$' "Control_L"
@@ -697,11 +707,11 @@ status_json() {
     if [[ -z $API_KEY ]]; then st=setup; fi
     API_KEY=""
   fi
-  printf '{"state":"%s","language":"%s","ptt":"%s","toggle":"%s","output":"%s"}\n' \
+  printf '{"state":"%s","language":"%s","ptt":"%s","toggle":"%s","output":"%s","overlay":%s}\n' \
     "$st" "$(json_escape "$(current_language)")" \
     "$(json_escape "$(combo_label "$PTT_MODS" "$PTT_KEY")")" \
     "$(json_escape "$(combo_label "$TOGGLE_MODS" "$TOGGLE_KEY")")" \
-    "$OUTPUT_MODE"
+    "$OUTPUT_MODE" "$OVERLAY"
 }
 
 # Writes the status file the bar widget watches. Safe to call with or without the lock.
@@ -826,16 +836,22 @@ do_start_locked() {  # PTT_FLAG
       ( sleep "$secs"; "$SELF" _reveal "$sid" ) </dev/null >/dev/null 2>&1 9>&- &
     fi
   else
-    notify_user "$(t recording)"
+    notify_recording
     refresh_bar
   fi
+}
+
+# The overlay at the bottom of the screen shows recording; the notification is
+# only the fallback when the overlay is turned off.
+notify_recording() {
+  if [[ $OVERLAY != true ]]; then notify_user "$(t recording)"; fi
 }
 
 reveal_session() {  # SESSION_ID - used by the push-to-talk delay
   acquire_lock
   if [[ $(effective_state) == recording && $(read_file "$SESSION_FILE") == "$1" && ! -e $SHOWN_FILE ]]; then
     touch "$SHOWN_FILE"
-    notify_user "$(t recording)"
+    notify_recording
     refresh_bar
   fi
   release_lock
@@ -1239,6 +1255,7 @@ readonly ICON_LOG=$(printf '\xf3\xb0\x88\x99')       # md-file_document
 readonly ICON_DOT=$(printf '\xf3\xb0\x9d\xa5')       # md-circle_small
 readonly ICON_EDIT=$(printf '\xf3\xb0\x8f\xab')      # md-pencil
 readonly ICON_OFF=$(printf '\xf3\xb0\x85\x96')       # md-close
+readonly ICON_OVERLAY=$(printf '\xf3\xb0\x8d\xb9')   # md-monitor
 readonly ICON_OK=$(printf '\xf3\xb0\x84\xac')        # md-check
 
 key_subtext() {
@@ -1376,6 +1393,12 @@ menu_output() {
   return 1
 }
 
+toggle_overlay() {
+  if [[ $OVERLAY == true ]]; then config_set OVERLAY false; else config_set OVERLAY true; fi
+  refresh_bar
+  notify_user "$(t overlay_set "$(t "overlay_$OVERLAY")")"
+}
+
 cmd_menu() {
   have omarchy-menu-select || { notify_user -f "$(t err_no_menu)"; die "omarchy-menu-select not found"; }
   local ptt toggle
@@ -1388,6 +1411,7 @@ cmd_menu() {
       "$(row "$ICON_MIC" "$(t menu_ptt)" "$ptt")" \
       "$(row "$ICON_KEYBOARD" "$(t menu_toggle)" "$toggle")" \
       "$(row "$ICON_OUTPUT" "$(t menu_output)" "$(output_label "$OUTPUT_MODE")")" \
+      "$(row "$ICON_OVERLAY" "$(t menu_overlay)" "$(t "overlay_$OVERLAY")")" \
       "$(row "$ICON_TEST" "$(t menu_test)" "$(t menu_test_sub)")" \
       "$(row "$ICON_LOG" "$(t menu_log)" "${LOG_FILE/#$HOME/\~}")" || return 0
 
@@ -1399,6 +1423,7 @@ cmd_menu() {
       "$(t menu_ptt)") menu_hotkey ptt && return 0 ;;
       "$(t menu_toggle)") menu_hotkey toggle && return 0 ;;
       "$(t menu_output)") menu_output && return 0 ;;
+      "$(t menu_overlay)") toggle_overlay; return 0 ;;
       *) return 0 ;;
     esac
     # A dismissed submenu returns to the main menu.

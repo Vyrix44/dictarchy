@@ -12,8 +12,10 @@ opens the settings and switches the language.
 - **Push-to-talk** on Left Ctrl by default: hold to record, release to transcribe.
   Short taps (Ctrl+C and friends) stay silent, and Ctrl keeps working in every app.
 - **Toggle** on Super+Alt+D by default.
-- **Bar widget** for the Omarchy shell: microphone icon with the language, red while recording,
-  an hourglass while transcribing, and "Setup needed" until an API key is saved.
+- **Bar widget** for the Omarchy shell: the dictarchy mark (five voice bars rising to a peak) with
+  the language, red while recording, pulsing while transcribing, and "Setup needed" until an API key is saved.
+- **Recording overlay** at the bottom of the screen: a live waveform of your microphone while you speak,
+  a running wave while the text is transcribed. It takes no clicks or keyboard focus.
 - **Settings menu** in the Omarchy menu: API key, language, push-to-talk key, toggle key, output, test, log.
 - The **API key** is only ever entered in a floating terminal with hidden input, checked against the API,
   and stored with mode 600. It never appears in process arguments, logs or notifications.
@@ -55,7 +57,8 @@ The installer does not ask for anything except missing packages. It:
 1. checks the Omarchy version and the dependencies,
 2. copies `bin/dictarchy` to `~/.local/bin/dictarchy`,
 3. creates `~/.config/dictarchy/config` from `config/config.example` (an existing file is kept),
-4. copies the bar widget to `~/.config/omarchy/plugins/io.github.vyrix44.dictarchy/`,
+4. copies the bar widget and overlay to `~/.config/omarchy/plugins/io.github.vyrix44.dictarchy/`
+   (and restarts the Omarchy shell when an update adds files to it, since the shell caches the file list),
 5. appends a block between `-- >>> dictarchy >>>` and `-- <<< dictarchy <<<` to
    `~/.config/hypr/hyprland.lua` that loads `~/.config/hypr/dictarchy.lua`, then writes that file
    and reloads Hyprland (warning about hotkey conflicts),
@@ -96,6 +99,7 @@ The settings menu:
 | Push-to-talk key | Left/Right Ctrl, Right Alt, Right Super, F9, a custom combination, or off |
 | Toggle key       | Super+Alt+D, a custom combination, or off |
 | Output           | type and copy, type only, or clipboard only |
+| Recording overlay | turn the overlay at the bottom of the screen on or off |
 | Test             | checks tools, key, API connection, hotkeys and bar entry, then transcribes a 4-second sample in the terminal |
 | Log              | opens the log in a floating terminal |
 
@@ -106,7 +110,7 @@ Omarchy's own dictation (when a backend is selected) uses Alt+Space and Right Al
 
 | Action       | Default        | Behavior |
 |--------------|----------------|----------|
-| Push-to-talk | hold Left Ctrl | Records while held, transcribes on release. Shows "Recording..." only after `MIN_DURATION_MS`. |
+| Push-to-talk | hold Left Ctrl | Records while held, transcribes on release. The overlay appears only after `MIN_DURATION_MS`. |
 | Toggle       | Super+Alt+D    | Press to start, press again to stop and transcribe. |
 
 The bindings are generated into `~/.config/hypr/dictarchy.lua` with Omarchy's `o.bind_hold` and
@@ -133,6 +137,7 @@ See [`config/config.example`](config/config.example) for the commented defaults.
 | `TOGGLE_KEY` | `D` | Toggle key; empty disables it |
 | `TOGGLE_MODS` | `SUPER ALT` | Modifiers for the toggle key |
 | `NOTIFY` | `true` | Desktop notifications (errors are always shown) |
+| `OVERLAY` | `true` | Recording overlay at the bottom of the screen |
 
 The language picked by scrolling or in the menu is stored in `~/.local/state/dictarchy/language` and
 overrides `LANGUAGE`. A `WAYBAR_SIGNAL` line from dictarchy 0.1 is ignored.
@@ -150,10 +155,21 @@ dictarchy status          # JSON for the bar widget
 dictarchy log
 ```
 
+## Recording overlay
+
+While dictarchy records, a small card appears at the bottom center of the focused monitor: a red dot and a
+scrolling waveform of the microphone level. While the audio is transcribed, the bars turn into a running wave in
+the theme's accent color; the card disappears when the text arrives. Push-to-talk taps shorter than
+`MIN_DURATION_MS` never show it. The card follows the Omarchy theme (colors, border, corner rounding) and lets
+every click through. The level comes from the default PipeWire source; a virtual source shows a flat line.
+
+Turn it off with *Recording overlay* in the menu or `OVERLAY="false"` in the config. With the overlay off,
+a "Recording..." notification marks the start of a recording instead.
+
 ## How the widget gets its state
 
 `dictarchy` writes its status as JSON to `$XDG_RUNTIME_DIR/dictarchy/status.json` on every change.
-The widget watches that file and also runs `dictarchy status --write` every 5 seconds, which catches
+The bar widget and the overlay service watch that file; the widget and also runs `dictarchy status --write` every 5 seconds, which catches
 stale states and keys added by hand. It calls `~/.local/bin/dictarchy`; set `"command"` on the widget's
 entry in `shell.json` to use another path.
 
@@ -199,8 +215,8 @@ bash tests/smoke.sh   # stub-based; needs no audio device, network, Wayland or r
 
 The test replaces every external tool with a stub and covers configuration parsing, recording, push-to-talk,
 the setup state and key handling, language cycling, status JSON, API errors, the generated Lua bindings
-(checked with `luac` and a Lua harness), the settings menu, and an install/uninstall round trip in a sandbox
-`HOME` that must leave `hyprland.lua` and `shell.json` exactly as they were.
+(checked with `luac` and a Lua harness), the settings menu, the widget's QML syntax and status parser, and an
+install/uninstall round trip in a sandbox `HOME` that must leave `hyprland.lua` and `shell.json` exactly as they were.
 
 ## License
 

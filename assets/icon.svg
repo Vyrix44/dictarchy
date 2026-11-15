@@ -1,4 +1,8 @@
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64">
-  <rect width="64" height="64" rx="14" fill="#db2777"/>
-  <text x="32" y="32" dy="0.35em" text-anchor="middle" font-family="ui-sans-serif, system-ui, -apple-system, sans-serif" font-size="26" font-weight="600" fill="#ffffff">ST</text>
+  <!-- dictarchy: five voice bars rising to a peak (the "Arch wave"). Same
+       geometry as plugin/ArchWave.qml, on a 16-unit grid scaled by 3 with an 8px margin. -->
+  <rect width="64" height="64" rx="14" fill="#1e1e2e"/>
+  <g transform="translate(8 8) scale(3)" fill="none" stroke="#f5f5f7" stroke-width="1.8" stroke-linecap="round">
+    <path d="M2 14v-3M5 14V7.5M8 14V2M11 14V7.5M14 14v-3"/>
+  </g>
 </svg>

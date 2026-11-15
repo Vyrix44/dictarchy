@@ -65,3 +65,7 @@ TOGGLE_MODS="SUPER ALT"
 
 # Desktop notifications for start, results and errors. Errors are shown even when false.
 NOTIFY="true"
+
+# Recording overlay: a small card with a live waveform at the bottom of the
+# screen while recording and transcribing. Also switchable from the menu.
+OVERLAY="true"
