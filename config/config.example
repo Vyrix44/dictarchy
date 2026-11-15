@@ -1,6 +1,6 @@
 # dictarchy configuration
 #
-# Copy to ~/.config/dictarchy/config (install.sh does this for you).
+# Copy to ~/.config/dictarchy/config (dictarchy and install.sh create it for you).
 # Format: one KEY=value per line. Values may be wrapped in "..." or '...'.
 # Comments and blank lines are ignored. Inline comments are NOT supported,
 # because values such as PROMPT may contain "#".
@@ -8,6 +8,7 @@
 #
 # Most settings can be changed from the menu: right-click the dictarchy icon in
 # the bar. After editing the hotkeys here by hand, run:  dictarchy bindings
+# (the hotkeys are set in the running Hyprland; the Hyprland config is not edited)
 #
 # The API key is NOT stored here. It lives in ~/.config/dictarchy/api_key
 # (written when you click the bar icon, or by "dictarchy key"), or in the

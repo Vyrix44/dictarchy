@@ -1,13 +1,13 @@
 #!/usr/bin/env bash
 # uninstall.sh - removes dictarchy from the current user's account.
 #
-# Removes (after backups of every edited file): the bar entry in
-# ~/.config/omarchy/shell.json, the plugin folder (also one added with
-# "omarchy plugin add"), the marked block in
-# ~/.config/hypr/hyprland.lua, ~/.config/hypr/dictarchy.lua,
-# ~/.local/bin/dictarchy and the runtime directory. The config directory (it
-# holds the API key) and the state directory (log, language) are kept unless
-# you confirm their removal.
+# Removes (after backups of every edited file): the hotkeys from the running
+# Hyprland, the bar entry in ~/.config/omarchy/shell.json, the plugin folder
+# (also one added with "omarchy plugin add"), ~/.local/bin/dictarchy and the
+# runtime directory, plus what versions before 0.5 put into the Hyprland config
+# (the marked block in ~/.config/hypr/hyprland.lua and ~/.config/hypr/dictarchy.lua).
+# The config directory (it holds the API key) and the state directory (log,
+# language) are kept unless you confirm their removal.
 set -euo pipefail
 
 readonly CONFIG_HOME="${XDG_CONFIG_HOME:-$HOME/.config}"
@@ -26,6 +26,7 @@ readonly MARK_BEGIN="-- >>> dictarchy >>>"
 readonly MARK_END="-- <<< dictarchy <<<"
 
 ASSUME_YES=0
+LEGACY_LOADED=0   # set when the old bindings file was there: Hyprland must reload
 STAMP=$(date +%Y%m%d-%H%M%S)
 readonly STAMP
 
@@ -75,9 +76,22 @@ remove_bar_entry() {
   fi
 }
 
+remove_hotkeys() {
+  info "Hotkeys"
+  if have hyprctl && [[ -n ${HYPRLAND_INSTANCE_SIGNATURE:-} ]]; then
+    hyprctl dispatch "(function() if dictarchy_hotkeys then dictarchy_hotkeys.clear() end return hl.dsp.exec_cmd('true') end)()" \
+      >/dev/null 2>&1 || true
+    echo "  removed from the running Hyprland"
+  else
+    echo "  Hyprland is not running - nothing to remove"
+  fi
+}
+
+# Versions before 0.5 loaded the hotkeys from hyprland.lua.
 remove_hypr_block() {
-  info "Hyprland block"
-  if [[ ! -f $HYPR_CONF ]] || ! grep -qxF -- "$MARK_BEGIN" "$HYPR_CONF"; then
+  info "Hyprland config"
+  if [[ ! -f $HYPR_CONF ]] || ! grep -qxF -- "$MARK_BEGIN" "$HYPR_CONF" \
+     || ! grep -qxF -- "$MARK_END" "$HYPR_CONF"; then
     echo "  no dictarchy block in $HYPR_CONF"
     return 0
   fi
@@ -90,13 +104,16 @@ remove_hypr_block() {
     { if (held) print prev; prev = $0; held = 1 }
     END { if (held) print prev }
   ' "$HYPR_CONF" > "$HYPR_CONF.tmp.$$"
-  mv -f -- "$HYPR_CONF.tmp.$$" "$HYPR_CONF"
+  # Written through, so a symlinked hyprland.lua (dotfile managers) stays a link.
+  cat -- "$HYPR_CONF.tmp.$$" > "$HYPR_CONF"
+  rm -f -- "$HYPR_CONF.tmp.$$"
   echo "  removed the dictarchy block from $HYPR_CONF"
 }
 
 remove_files() {
   info "Files"
   local f
+  if [[ -f $BINDINGS ]]; then LEGACY_LOADED=1; fi
   for f in "$BINDINGS" "$BIN"; do
     if [[ -e $f || -L $f ]]; then
       rm -f -- "$f"
@@ -146,7 +163,8 @@ remove_dirs_on_request() {
 }
 
 reload_hyprland() {
-  if have hyprctl; then
+  # Only for the old bindings file: Hyprland keeps the binds it loaded from it.
+  if (( LEGACY_LOADED )) && have hyprctl; then
     hyprctl reload >/dev/null 2>&1 || warn "hyprctl reload failed"
   fi
 }
@@ -163,6 +181,7 @@ main() {
     echo "Aborted."
     exit 0
   fi
+  remove_hotkeys
   remove_bar_entry
   remove_hypr_block
   remove_files

@@ -17,6 +17,8 @@ opens the settings and switches the language.
 - **Recording overlay** at the bottom of the screen: a live waveform of your microphone while you speak,
   a running wave while the text is transcribed. It takes no clicks or keyboard focus.
 - **Settings menu** in the Omarchy menu: API key, language, push-to-talk key, toggle key, output, test, log.
+- **Leaves your Hyprland config alone**: the hotkeys are set inside the running Hyprland by the plugin
+  (in Lua, like Hyprland's own config), so `omarchy plugin add` and `omarchy plugin remove` are all it takes.
 - The **API key** is only ever entered in a floating terminal with hidden input, checked against the API,
   and stored with mode 600. It never appears in process arguments, logs or notifications.
 - Any **OpenAI-compatible** `/audio/transcriptions` endpoint. Groq is the default.
@@ -54,16 +56,26 @@ omarchy plugin add https://github.com/Vyrix44/dictarchy.git --enable
 
 It clones the repository to `~/.config/omarchy/plugins/io.github.vyrix44.dictarchy/`, checks it with
 `omarchy plugin validate`, asks where in the bar the widget goes (right by default) and enables it.
-The plugin manager only installs shell plugins, so the icon then shows **Setup needed**: click it once.
-A floating terminal runs the plugin's `install.sh --setup`, which sets up the hotkeys and the CLI
-(the steps below) and then asks for the API key.
+The hotkeys work right away (see [How the hotkeys work](#how-the-hotkeys-work)); the icon shows
+**Setup needed** until you click it and enter the API key (see [Setup](#setup)).
 
 Updates and removal:
 
 ```sh
-omarchy plugin update io.github.vyrix44.dictarchy                    # pulls and re-validates
-~/.config/omarchy/plugins/io.github.vyrix44.dictarchy/uninstall.sh    # see Uninstall
+omarchy plugin update io.github.vyrix44.dictarchy   # pulls and re-validates
+omarchy plugin remove io.github.vyrix44.dictarchy   # also removes the hotkeys; see Uninstall
 ```
+
+To use `dictarchy` in a terminal as well, run the plugin's installer once; it links `~/.local/bin/dictarchy`
+(the bar and the hotkeys don't need it):
+
+```sh
+~/.config/omarchy/plugins/io.github.vyrix44.dictarchy/install.sh
+```
+
+Coming from dictarchy 0.4 or older? The update removes what it put into the Hyprland config on its own:
+the block in `~/.config/hypr/hyprland.lua` (after a backup, `hyprland.lua.dictarchy-backup-<timestamp>`)
+and `~/.config/hypr/dictarchy.lua`.
 
 Coming from an older dictarchy that `install.sh` copied into the plugin folder? `omarchy plugin add`
 refuses an id that is already installed, so remove the copy first with `./uninstall.sh --yes`
@@ -77,7 +89,7 @@ cd dictarchy
 ./install.sh          # or ./install.sh --link to symlink the CLI to the checkout for development
 ```
 
-The installer does not ask for anything except missing packages (and, with `--setup`, the API key). It:
+The installer does not ask for anything except missing packages. It:
 
 1. checks the Omarchy version and the dependencies,
 2. copies the plugin to `~/.config/omarchy/plugins/io.github.vyrix44.dictarchy/` (skipped when it runs
@@ -85,20 +97,18 @@ The installer does not ask for anything except missing packages (and, with `--se
    shell when an update adds files, since the shell caches the file list),
 3. links `~/.local/bin/dictarchy` to the plugin's `bin/dictarchy`, so plugin updates update the command,
 4. creates `~/.config/dictarchy/config` from `config/config.example` (an existing file is kept),
-5. appends a block between `-- >>> dictarchy >>>` and `-- <<< dictarchy <<<` to
-   `~/.config/hypr/hyprland.lua` that loads `~/.config/hypr/dictarchy.lua`, then writes that file
-   and reloads Hyprland (warning about hotkey conflicts),
+5. sets the hotkeys in the running Hyprland (warning about hotkey conflicts) and removes what versions
+   before 0.5 added to the Hyprland config; it never writes to it,
 6. adds `{"id": "io.github.vyrix44.dictarchy"}` to `bar.layout.right` in `~/.config/omarchy/shell.json`,
    left of the volume icon, unless the widget is already in the bar. With the shell running this goes
    through `omarchy plugin enable`; otherwise the file is edited with jq.
 
 Every file it edits is backed up first as `<file>.dictarchy-backup-<timestamp>`. Running it again is safe:
-the Hyprland block is found by its markers and the bar entry by its id (JSON has no comments, so
-`shell.json` cannot carry markers).
+the bar entry is found by its id.
 
 ## Setup
 
-After installing, the bar icon shows **Setup needed** until the hotkeys are set up and an API key is saved.
+After installing, the bar icon shows **Setup needed** until an API key is saved.
 
 1. Create a Groq account at <https://console.groq.com>, open *API Keys* and create a key.
 2. Click the dictarchy icon. A floating terminal opens and asks for the key; the input is hidden.
@@ -139,8 +149,31 @@ Omarchy's own dictation (when a backend is selected) uses Alt+Space and Right Al
 | Push-to-talk | hold Left Alt | Records while held, transcribes on release. The overlay appears only after `MIN_DURATION_MS`. |
 | Toggle       | Super+Alt+D    | Press to start, press again to stop and transcribe. |
 
-The bindings are generated into `~/.config/hypr/dictarchy.lua` with Omarchy's `o.bind_hold` and
-`o.rebind`. Change them from the menu, or edit the config and run `dictarchy bindings`.
+Change them from the menu, or edit the config and run `dictarchy bindings`. A modifier key such as Left Alt
+is bound non-consuming, so Alt shortcuts keep working. Each hotkey replaces what Hyprland had bound to exactly
+that key combination (the menu asks first); a bind of yours on plain Left Alt would be replaced, Alt shortcuts are not.
+
+### How the hotkeys work
+
+Hyprland's config is Lua, and the binds are made in Lua too, but inside the running compositor rather than
+in your config files. The engine is `hypr/dictarchy.lua` in the plugin folder:
+
+- The plugin's shell service runs `dictarchy bindings --owner <token>` when the shell starts. That loads the
+  engine into Hyprland's Lua state over `hyprctl dispatch` and passes it the keys from the config.
+- A Hyprland config reload drops those binds, so the service sets them again after every reload.
+- Disabling or removing the plugin removes them. The token keeps an old service instance (a shell reload)
+  from removing the binds a newer one set.
+- A key change from the menu reloads Hyprland, so whatever the old key had replaced comes back, and sets the
+  binds again.
+
+The engine removes its binds by key combination with `hl.unbind`, as Omarchy's `o.rebind` does. It never keeps
+the handles `hl.bind` returns. A config reload frees every bind but keeps the Lua state, and touching a freed
+bind's handle crashes Hyprland 0.56. When Hyprland has none of dictarchy's binds, the CLI tells the engine that
+a reload happened, so it leaves the combinations it bound before alone.
+
+Push-to-talk uses the same press/release scheme as Omarchy's `o.bind_hold`: the release half is transparent,
+ignores modifiers and only runs after its own press. There is a short gap at login, until the shell has
+started, in which the hotkeys are not bound yet.
 
 ## Configuration
 
@@ -175,7 +208,7 @@ dictarchy toggle | start [--ptt] | stop [--ptt] | cancel
 dictarchy menu            # the settings menu
 dictarchy key             # enter the API key (opens a floating terminal outside a terminal)
 dictarchy lang [next|prev|CODE]
-dictarchy bindings        # regenerate ~/.config/hypr/dictarchy.lua and reload Hyprland
+dictarchy bindings [--clear]  # set the hotkeys in the running Hyprland from the config, or remove them
 dictarchy test            # setup check plus a sample transcription
 dictarchy status          # JSON for the bar widget
 dictarchy log
@@ -212,9 +245,9 @@ Start with **Test** in the menu (or `dictarchy test` in a terminal), then the lo
 (`~/.local/state/dictarchy/dictarchy.log`).
 
 - **"Invalid API key"**: right-click the icon, choose *API key*, and enter a new one.
-- **Nothing happens on the hotkey**: run `dictarchy bindings`, then `hyprctl configerrors`.
-  Check that the dictarchy block is in `~/.config/hypr/hyprland.lua` and that
-  `omarchy menu keybindings --print` lists the *Dictarchy* bindings.
+- **Nothing happens on the hotkey**: check that the plugin is enabled (`omarchy plugin list`), then run
+  `dictarchy bindings` in a terminal; it prints the keys or the error Hyprland reported (also in the log).
+  `hyprctl binds | grep -A3 Dictarchy` shows the binds Hyprland has.
 - **The icon is missing**: run `omarchy plugin list` and check that `io.github.vyrix44.dictarchy` is in
   `bar.layout` in `~/.config/omarchy/shell.json`; `omarchy-shell shell rescanPlugins` forces a rescan.
 - **Text is not typed**: `wtype` needs a Wayland session with virtual keyboard support. Check that
@@ -226,16 +259,25 @@ Start with **Test** in the menu (or `dictarchy test` in a terminal), then the lo
 ## Uninstall
 
 ```sh
+omarchy plugin remove io.github.vyrix44.dictarchy
+```
+
+This unloads the plugin, which removes the hotkeys from Hyprland, and deletes the plugin folder. Left behind
+are `~/.config/dictarchy/` (config and API key), `~/.local/state/dictarchy/` (log and language) and, if you ran
+`install.sh`, the `~/.local/bin/dictarchy` link. A bind that the toggle key replaced comes back with the next
+Hyprland reload (`hyprctl reload`).
+
+To remove everything, run the uninstaller instead:
+
+```sh
 ~/.config/omarchy/plugins/io.github.vyrix44.dictarchy/uninstall.sh   # or ./uninstall.sh in a checkout
                                                                       # --yes skips the questions, keeps config and log
 ```
 
-Use this rather than `omarchy plugin remove` alone, which only deletes the plugin folder and leaves the
-Hyprland block behind (the hotkeys then do nothing, since `dictarchy.lua` skips its binds when the command is gone).
-
-It removes the bar entry from `shell.json` and the Hyprland block (both after backups), unloads and deletes the plugin folder,
-`~/.config/hypr/dictarchy.lua`, `~/.local/bin/dictarchy` and the runtime directory. It asks before deleting
-the config directory (it contains your API key) and the state directory (log and language).
+It removes the hotkeys from the running Hyprland and the bar entry from `shell.json` (after a backup). It then
+unloads and deletes the plugin folder, `~/.local/bin/dictarchy` and the runtime directory, and removes what
+versions before 0.5 put into the Hyprland config. It asks before deleting the config directory (it contains
+your API key) and the state directory (log and language).
 
 ## Development
 
@@ -244,10 +286,19 @@ bash tests/smoke.sh   # stub-based; needs no audio device, network, Wayland or r
 ```
 
 The test replaces every external tool with a stub and covers configuration parsing, recording, push-to-talk,
-the setup state and key handling, language cycling, status JSON, API errors, the generated Lua bindings
-(checked with `luac` and a Lua harness), the settings menu, the widget's QML syntax and status parser, an
-install/uninstall round trip in a sandbox `HOME` that must leave `hyprland.lua` and `shell.json` exactly as they were,
-and the `omarchy plugin add` flow (the repository root as the plugin folder, setup from there).
+the setup state and key handling, language cycling, status JSON, API errors, the hotkeys (the dispatched Lua
+expression is run against the real engine and a stub `hl`), the migration from the old `hyprland.lua` block, the
+settings menu, the widget's QML syntax and status parser, an install/uninstall round trip in a sandbox `HOME`
+that must leave `hyprland.lua` and `shell.json` exactly as they were, and the `omarchy plugin add` flow (the
+repository root as the plugin folder).
+
+The hotkey engine has its own plain-Lua test (also run by `smoke.sh`). It checks the bind options, the
+push-to-talk press/release logic, that no bind handle is ever used (also across config reloads and from an
+older engine's state), and the owner token:
+
+```sh
+lua tests/hotkeys_test.lua
+```
 
 ## License
 

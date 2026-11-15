@@ -1,25 +1,25 @@
 #!/usr/bin/env bash
 # install.sh - installs dictarchy for the current user on Omarchy 4.5 or newer.
 #
-# Usage: ./install.sh [--link] [--setup]
+# Usage: ./install.sh [--link]
 #   --link   symlink ~/.local/bin/dictarchy to this checkout (for development)
-#   --setup  ask for the API key at the end when none is saved yet; used when the
-#            bar icon is clicked after "omarchy plugin add"
 #
-# The repository is the plugin folder. "omarchy plugin add" clones it to
-# ~/.config/omarchy/plugins/io.github.vyrix44.dictarchy/ and enables the widget;
-# this script, run from there, does the rest. Run from any other checkout, it
-# copies the plugin there first.
+# The repository is the plugin folder. "omarchy plugin add ... --enable" alone
+# is a complete install: the plugin's service sets the hotkeys inside Hyprland.
+# This script is the alternative from a checkout, and adds the terminal command.
+# Run from any other checkout, it copies the plugin to
+# ~/.config/omarchy/plugins/io.github.vyrix44.dictarchy/ first.
 #
 # What it does (nothing system-wide; missing packages only after you confirm):
 #   1. the plugin in ~/.config/omarchy/plugins/io.github.vyrix44.dictarchy/
 #   2. ~/.local/bin/dictarchy (a symlink to the plugin's bin/dictarchy) and
 #      ~/.config/dictarchy/config (an existing config is kept)
-#   3. a marked block in ~/.config/hypr/hyprland.lua that loads hypr/dictarchy.lua
+#   3. the hotkeys in the running Hyprland; the Hyprland config is not edited
+#      (the block older versions added to hyprland.lua is removed, after a backup)
 #   4. the widget entry in ~/.config/omarchy/shell.json (bar.layout.right)
 # Every file it edits is backed up first (*.dictarchy-backup-<timestamp>).
-# Without --setup it does not ask for the API key: the bar icon shows "Setup
-# needed" until you click it and enter the key in a floating terminal.
+# It does not ask for the API key: the bar icon shows "Setup needed" until you
+# click it and enter the key in a floating terminal.
 set -euo pipefail
 
 SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
@@ -31,23 +31,20 @@ readonly BIN_DIR="$HOME/.local/bin"
 readonly BIN="$BIN_DIR/dictarchy"
 readonly HYPR_DIR="$CONFIG_HOME/hypr"
 readonly HYPR_CONF="$HYPR_DIR/hyprland.lua"
-readonly LEGACY_BINDINGS="$HYPR_DIR/dictarchy.conf"
+readonly LEGACY_CONF_BINDINGS="$HYPR_DIR/dictarchy.conf"
 readonly PLUGIN_ID="io.github.vyrix44.dictarchy"
 readonly PLUGIN_DIR="$CONFIG_HOME/omarchy/plugins/$PLUGIN_ID"
 readonly SHELL_JSON="$CONFIG_HOME/omarchy/shell.json"
 readonly OMARCHY_ROOT="${OMARCHY_PATH:-/usr/share/omarchy}"
-readonly MARK_BEGIN="-- >>> dictarchy >>>"
-readonly MARK_END="-- <<< dictarchy <<<"
 readonly BAR_BEFORE="omarchy.audio"   # the widget goes left of the volume icon when present
 
 # What a plugin folder needs; the tests and the git metadata stay in the checkout.
 readonly -a PLUGIN_FILES=(
   manifest.json BarWidget.qml Service.qml ArchWave.qml StatusModel.js i18n
-  bin config assets install.sh uninstall.sh README.md CHANGELOG.md LICENSE
+  bin hypr config assets install.sh uninstall.sh README.md CHANGELOG.md LICENSE
 )
 
 LINK=0
-SETUP=0
 PLUGIN_FILES_CHANGED=0
 STAMP=$(date +%Y%m%d-%H%M%S)
 readonly STAMP
@@ -74,11 +71,10 @@ backup() {  # FILE - copies FILE next to itself, prints the backup path
 
 usage() {
   cat <<'EOF'
-Usage: ./install.sh [--link] [--setup]
+Usage: ./install.sh [--link]
 
   --link   symlink ~/.local/bin/dictarchy to this checkout instead of the plugin
            folder (the plugin itself is always copied: the shell refuses symlinks)
-  --setup  ask for the API key at the end when none is saved yet
 EOF
 }
 
@@ -87,7 +83,9 @@ parse_args() {
   for arg in "$@"; do
     case $arg in
       --link) LINK=1 ;;
-      --setup) SETUP=1 ;;
+      # Older widgets ran "install.sh --setup" on the first click; it has nothing
+      # left to do beyond a normal install.
+      --setup) ;;
       -h|--help) usage; exit 0 ;;
       *) die "unknown option: $arg (see --help)" ;;
     esac
@@ -258,45 +256,27 @@ check_hypr_conflicts() {
   fi
 }
 
-install_hypr_block() {
-  info "Hyprland configuration"
-  if grep -qxF -- "$MARK_BEGIN" "$HYPR_CONF"; then
-    echo "  dictarchy block already present in $HYPR_CONF"
-  else
-    echo "  backup: $(backup "$HYPR_CONF")"
-    {
-      echo ""
-      echo "$MARK_BEGIN"
-      echo "-- Managed by dictarchy (install.sh / uninstall.sh) - do not edit between these markers."
-      echo "-- Loads the hotkeys from ~/.config/hypr/dictarchy.lua when that file exists."
-      echo "do"
-      echo "  local file = io.open(os.getenv(\"HOME\") .. \"/.config/hypr/dictarchy.lua\", \"r\")"
-      echo "  if file then"
-      echo "    file:close()"
-      echo "    require(\"hypr.dictarchy\")"
-      echo "  end"
-      echo "end"
-      echo "$MARK_END"
-    } >> "$HYPR_CONF"
-    echo "  added the dictarchy block to $HYPR_CONF"
-  fi
-  # Leftover from dictarchy 0.1 (hyprlang bindings, never loaded by a Lua config).
-  if [[ -f $LEGACY_BINDINGS ]] && grep -q '^# managed by dictarchy' "$LEGACY_BINDINGS"; then
-    rm -f -- "$LEGACY_BINDINGS"
-    echo "  removed the old $LEGACY_BINDINGS"
-  fi
-}
-
-generate_bindings() {
+# The hotkeys are not part of the Hyprland config any more: "dictarchy bindings"
+# removes what older versions put there and sets the binds in the running
+# Hyprland. The plugin's service does the same whenever the shell starts.
+install_hotkeys() {
   info "Hotkeys"
-  check_hypr_conflicts
-  if "$BIN" bindings >/dev/null; then
-    "$BIN" status | jq -r '"  push-to-talk: \(if .ptt == "" then "off" else .ptt + " (hold)" end)",
-                           "  toggle:       \(if .toggle == "" then "off" else .toggle end)"'
-    echo "  written to $HYPR_DIR/dictarchy.lua"
-  else
-    warn "Hyprland reported errors after loading the bindings - check: hyprctl configerrors"
+  # Leftover from dictarchy 0.1 (hyprlang bindings, never loaded by a Lua config).
+  if [[ -f $LEGACY_CONF_BINDINGS ]] && grep -q '^# managed by dictarchy' "$LEGACY_CONF_BINDINGS"; then
+    rm -f -- "$LEGACY_CONF_BINDINGS"
+    echo "  removed the old $LEGACY_CONF_BINDINGS"
   fi
+  if grep -qxF -- "-- >>> dictarchy >>>" "$HYPR_CONF" 2>/dev/null; then
+    echo "  removing the dictarchy block older versions added to $HYPR_CONF (a backup is kept)"
+  fi
+  check_hypr_conflicts
+  if "$BIN" bindings >/dev/null 2>&1; then
+    echo "  set in the running Hyprland"
+  else
+    echo "  not set now - the plugin sets them when the Omarchy shell starts"
+  fi
+  "$BIN" status | jq -r '"  push-to-talk: \(if .ptt == "" then "off" else .ptt + " (hold)" end)",
+                         "  toggle:       \(if .toggle == "" then "off" else .toggle end)"'
 }
 
 shell_running() {
@@ -357,17 +337,12 @@ install_bar_entry() {
 
 main() {
   parse_args "$@"
-  if (( SETUP )) && [[ -t 0 ]]; then
-    # The floating terminal closes when this script ends: keep an error readable.
-    trap 'rc=$?; if (( rc != 0 )); then read -r -p "Setup failed. Press Enter to close. " _ || true; fi' EXIT
-  fi
   check_omarchy
   check_dependencies
   install_plugin
   install_binary
   install_config
-  install_hypr_block
-  generate_bindings
+  install_hotkeys
   install_bar_entry
   "$BIN" status --write >/dev/null 2>&1 || true
   if (( PLUGIN_FILES_CHANGED )) && shell_running && have omarchy-restart-shell; then
@@ -376,29 +351,9 @@ main() {
   fi
   echo
   info "Done."
-  if (( SETUP )); then
-    finish_setup
-    return 0
-  fi
   echo "The dictarchy icon in the bar shows \"Setup needed\" until an API key is saved."
   echo "Click it to enter your Groq API key (https://console.groq.com/keys) in a"
   echo "floating terminal. Right-click it for settings, scroll on it to change the language."
-}
-
-# --setup: the terminal the bar icon opened. Ask for the key right here when none
-# is saved yet ("dictarchy key" waits for Enter itself), otherwise wait for Enter.
-finish_setup() {
-  local status
-  status=$("$BIN" status --write 2>/dev/null || true)
-  if [[ -t 0 ]] && jq -e '.state == "setup"' <<< "$status" >/dev/null 2>&1; then
-    echo
-    "$BIN" key
-    return 0
-  fi
-  echo "Right-click the dictarchy icon for settings, scroll on it to change the language."
-  if [[ -t 0 ]]; then
-    read -r -p "Press Enter to close. " _ || true
-  fi
 }
 
 main "$@"
