@@ -1,0 +1,69 @@
+# dictarchy configuration
+#
+# Copy to ~/.config/dictarchy/config (install.sh does this for you).
+# Format: one KEY=value per line. Values may be wrapped in "..." or '...'.
+# Comments and blank lines are ignored. Inline comments are NOT supported,
+# because values such as PROMPT may contain "#".
+# This file is parsed, never sourced. Unknown keys are ignored with a warning.
+#
+# After changing hotkeys, run:  dictarchy bindings
+# (dictarchy setup asks for the hotkeys interactively and runs this for you.)
+#
+# The API key is NOT stored here. It lives in ~/.config/dictarchy/api_key
+# (written by dictarchy setup), or in the environment variables
+# DICTARCHY_API_KEY or GROQ_API_KEY.
+
+# OpenAI-compatible base URL. The client calls $API_BASE_URL/audio/transcriptions.
+# Groq (default): https://api.groq.com/openai/v1
+# OpenAI:         https://api.openai.com/v1
+API_BASE_URL="https://api.groq.com/openai/v1"
+
+# Transcription model, e.g. whisper-large-v3-turbo (Groq) or whisper-1 (OpenAI).
+MODEL="whisper-large-v3-turbo"
+
+# Language of the speech as an ISO 639-1 code (en, de, fr, ...),
+# or "auto" to omit the language parameter and let the model detect it.
+# The language chosen with "dictarchy lang next" or "dictarchy lang <code>"
+# is stored separately and overrides this value.
+LANGUAGE="en"
+
+# Languages that "dictarchy lang next" cycles through, space-separated.
+LANGUAGES="en de auto"
+
+# Optional vocabulary or style hint for Whisper, sent as the "prompt" parameter.
+# Useful for names and technical terms, e.g. "Hyprland, Omarchy, Waybar, kubectl".
+PROMPT=""
+
+# Where the transcript goes: both (type it and copy to clipboard), type, clipboard.
+OUTPUT_MODE="both"
+
+# Append a space after typed text (so consecutive dictations do not run together).
+TRAILING_SPACE="true"
+
+# Recordings shorter than this (milliseconds) are discarded without a request.
+# This is what keeps short Ctrl taps (Ctrl+C and friends) silent.
+MIN_DURATION_MS=400
+
+# Recordings whose loudest peak is below this level (dBFS) are discarded.
+# Needs ffmpeg. Lower it (e.g. -60) if quiet speech gets discarded.
+SILENCE_THRESHOLD_DB=-50
+
+# Push-to-talk: hold this key to record, release to transcribe.
+# Use the Hyprland/xkb key name, e.g. Control_L, Shift_R, F9. Empty disables it.
+PTT_KEY="Control_L"
+
+# Modifiers that must be held together with PTT_KEY, space-separated
+# (SUPER, CTRL, ALT, SHIFT). Empty for none.
+PTT_MODS=""
+
+# Toggle: press once to start, press again to stop. Empty disables it.
+TOGGLE_KEY="D"
+
+# Modifiers for the toggle key, space-separated.
+TOGGLE_MODS="SUPER ALT"
+
+# Waybar custom-module signal (must match "signal" in the Waybar module).
+WAYBAR_SIGNAL=11
+
+# Desktop notifications for start, results and errors. Errors are shown even when false.
+NOTIFY="true"

@@ -1,0 +1,17 @@
+# Local configuration and secrets, in case they are placed in the checkout
+config/config
+api_key
+*.env
+.env
+
+# Backups created by install.sh / uninstall.sh and temporary files
+*.dictarchy-backup-*
+*.bak
+*.tmp
+*.swp
+*~
+
+# Editor and OS files
+.idea/
+.vscode/
+.DS_Store

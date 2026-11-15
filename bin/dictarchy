@@ -1,0 +1,981 @@
+#!/usr/bin/env bash
+# dictarchy - speech-to-text via a cloud API, driven by hotkeys (Omarchy / Hyprland).
+# Run "dictarchy help" for the command overview.
+set -euo pipefail
+
+readonly VERSION="0.1.0"
+readonly SELF="$(readlink -f -- "${BASH_SOURCE[0]}")"
+
+# ---------------------------------------------------------------------------
+# Paths
+# ---------------------------------------------------------------------------
+readonly CONFIG_HOME="${XDG_CONFIG_HOME:-$HOME/.config}"
+readonly STATE_HOME="${XDG_STATE_HOME:-$HOME/.local/state}"
+readonly RUNTIME_BASE="${XDG_RUNTIME_DIR:-/tmp/dictarchy-runtime-$(id -u)}"
+
+readonly CONFIG_DIR="$CONFIG_HOME/dictarchy"
+readonly CONFIG_FILE="$CONFIG_DIR/config"
+readonly API_KEY_FILE="$CONFIG_DIR/api_key"
+readonly HYPR_DIR="$CONFIG_HOME/hypr"
+readonly BINDINGS_FILE="$HYPR_DIR/dictarchy.conf"
+
+readonly STATE_DIR="$STATE_HOME/dictarchy"
+readonly LANG_FILE="$STATE_DIR/language"
+readonly LOG_FILE="$STATE_DIR/dictarchy.log"
+
+readonly RUN_DIR="$RUNTIME_BASE/dictarchy"
+readonly LOCK_FILE="$RUN_DIR/lock"
+readonly STATE_FILE="$RUN_DIR/state"
+readonly PID_FILE="$RUN_DIR/pid"
+readonly START_FILE="$RUN_DIR/started_ms"
+readonly SESSION_FILE="$RUN_DIR/session"
+readonly SHOWN_FILE="$RUN_DIR/shown"
+readonly MODE_FILE="$RUN_DIR/mode"            # "ptt" or "toggle"
+readonly RELEASED_FILE="$RUN_DIR/ptt_released"  # release seen before its press
+readonly WAV_FILE="$RUN_DIR/recording.wav"
+
+# Nerd Font icons, written as UTF-8 bytes so they do not depend on the locale.
+readonly ICON_MIC=$(printf '\xf3\xb0\x8d\xac')        # md-microphone
+readonly ICON_MIC_ERROR=$(printf '\xf3\xb0\x8d\xad')  # md-microphone_off
+readonly ICON_BUSY=$(printf '\xf3\xb0\x94\x9f')       # md-timer_sand
+
+readonly ERROR_HOLD_SECONDS=3       # how long an error stays visible
+readonly ERROR_TIMEOUT=10           # stale "error" state is ignored after this
+readonly TRANSCRIBING_TIMEOUT=120   # stale "transcribing" state is ignored after this
+readonly LONG_RECORDING_MS=3000     # silent recordings this long are reported
+readonly STOP_WAIT_TENTHS=20        # wait up to 2 s for pw-record to exit
+readonly EARLY_RELEASE_MS=1000      # a push-to-talk release this recent cancels its press
+
+# ---------------------------------------------------------------------------
+# Configuration defaults (overridden by $CONFIG_FILE, never sourced)
+# ---------------------------------------------------------------------------
+readonly -a CONFIG_KEYS=(
+  API_BASE_URL MODEL LANGUAGE LANGUAGES PROMPT OUTPUT_MODE TRAILING_SPACE
+  MIN_DURATION_MS SILENCE_THRESHOLD_DB PTT_KEY PTT_MODS TOGGLE_KEY TOGGLE_MODS
+  WAYBAR_SIGNAL NOTIFY
+)
+API_BASE_URL="https://api.groq.com/openai/v1"
+MODEL="whisper-large-v3-turbo"
+LANGUAGE="en"
+LANGUAGES="en de auto"
+PROMPT=""
+OUTPUT_MODE="both"
+TRAILING_SPACE="true"
+MIN_DURATION_MS=400
+SILENCE_THRESHOLD_DB=-50
+PTT_KEY="Control_L"
+PTT_MODS=""
+TOGGLE_KEY="D"
+TOGGLE_MODS="SUPER ALT"
+WAYBAR_SIGNAL=11
+NOTIFY="true"
+
+API_KEY=""     # filled by resolve_api_key, never printed or logged
+PTT_MODE=0     # set by parse_ptt_flag
+
+# ---------------------------------------------------------------------------
+# Small helpers
+# ---------------------------------------------------------------------------
+warn() { printf 'dictarchy: %s\n' "$*" >&2; }
+die() { printf 'dictarchy: %s\n' "$*" >&2; exit 1; }
+usage_error() { printf 'dictarchy: %s\n' "$*" >&2; exit 2; }
+
+have() { command -v "$1" >/dev/null 2>&1; }
+
+trim() {
+  local s=$1
+  s=${s#"${s%%[![:space:]]*}"}
+  s=${s%"${s##*[![:space:]]}"}
+  printf '%s' "$s"
+}
+
+now_ms() { date +%s%3N; }
+
+read_file() {
+  local value=""
+  if [[ -r $1 ]]; then
+    IFS= read -r value < "$1" || true
+  fi
+  printf '%s' "$value"
+}
+
+file_age() {  # seconds since the file was last modified
+  local mtime
+  mtime=$(stat -c %Y "$1" 2>/dev/null || echo 0)
+  echo $(( $(date +%s) - mtime ))
+}
+
+pid_alive() {
+  local pid=$1 proc_state
+  [[ $pid =~ ^[0-9]+$ ]] || return 1
+  kill -0 "$pid" 2>/dev/null || return 1
+  proc_state=$(awk '{print $3}' "/proc/$pid/stat" 2>/dev/null || true)
+  [[ $proc_state != Z ]]
+}
+
+log_line() {  # never pass the API key or transcript text here
+  mkdir -p "$STATE_DIR" 2>/dev/null || return 0
+  printf '%s %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$*" >> "$LOG_FILE" 2>/dev/null || true
+}
+
+ensure_dirs() {
+  mkdir -p "$RUN_DIR" "$STATE_DIR"
+  chmod 700 "$RUN_DIR"
+}
+
+acquire_lock() {
+  exec 9>"$LOCK_FILE"
+  flock -w 10 9 || die "could not acquire lock $LOCK_FILE"
+}
+
+release_lock() {
+  exec 9>&-
+}
+
+notify_user() {  # [-f] MESSAGE - -f shows the message even when NOTIFY=false
+  local force=0
+  if [[ ${1:-} == -f ]]; then
+    force=1
+    shift
+  fi
+  if (( ! force )) && [[ $NOTIFY != true ]]; then
+    return 0
+  fi
+  have notify-send || return 0
+  notify-send -a dictarchy -h string:x-canonical-private-synchronous:dictarchy \
+    "dictarchy" "$*" >/dev/null 2>&1 || true
+}
+
+refresh_waybar() {
+  pkill -RTMIN+"$WAYBAR_SIGNAL" waybar >/dev/null 2>&1 || true
+}
+
+json_escape() {
+  local s=$1
+  s=${s//\\/\\\\}
+  s=${s//\"/\\\"}
+  s=${s//$'\n'/\\n}
+  s=${s//$'\t'/\\t}
+  printf '%s' "$s"
+}
+
+hotkey_label() {  # MODS KEY
+  if [[ -z $2 ]]; then
+    printf 'disabled'
+  elif [[ -z $1 ]]; then
+    printf '%s' "$2"
+  else
+    printf '%s + %s' "${1// / + }" "$2"
+  fi
+}
+
+modifier_for_key() {  # modifier keys report their modifier in the release mask
+  case $1 in
+    Control_L|Control_R) printf 'CTRL' ;;
+    Shift_L|Shift_R) printf 'SHIFT' ;;
+    Alt_L|Alt_R) printf 'ALT' ;;
+    Super_L|Super_R) printf 'SUPER' ;;
+    *) printf '' ;;
+  esac
+}
+
+merge_mods() {  # "MODS1" "MODS2" -> space-separated, de-duplicated
+  local -a words=() out=()
+  local w s seen
+  read -r -a words <<< "$1 $2"
+  for w in "${words[@]}"; do
+    seen=0
+    for s in "${out[@]}"; do
+      [[ $s == "$w" ]] && seen=1
+    done
+    if (( ! seen )); then out+=("$w"); fi
+  done
+  printf '%s' "${out[*]}"
+}
+
+# ---------------------------------------------------------------------------
+# Configuration
+# ---------------------------------------------------------------------------
+is_known_key() {
+  local k
+  for k in "${CONFIG_KEYS[@]}"; do
+    if [[ $k == "$1" ]]; then return 0; fi
+  done
+  return 1
+}
+
+unquote() {  # strip one pair of matching surrounding quotes
+  local s=$1 first last
+  first=${s:0:1}
+  last=${s: -1}
+  if (( ${#s} >= 2 )) && [[ ( $first == '"' && $last == '"' ) || ( $first == "'" && $last == "'" ) ]]; then
+    s=${s:1:${#s}-2}
+  fi
+  printf '%s' "$s"
+}
+
+check_value() {  # NAME REGEX FALLBACK
+  local value=${!1}
+  if [[ ! $value =~ $2 ]]; then
+    warn "invalid $1 in config, using default '$3'"
+    printf -v "$1" '%s' "$3"
+  fi
+}
+
+validate_config() {
+  check_value API_BASE_URL '^https?://[^[:space:]"]+$' "https://api.groq.com/openai/v1"
+  API_BASE_URL=${API_BASE_URL%/}
+  check_value MODEL '^[A-Za-z0-9._/-]+$' "whisper-large-v3-turbo"
+  check_value LANGUAGE '^([a-z]{2,3}|auto)$' "en"
+  check_value LANGUAGES '^[a-z ]+$' "en de auto"
+  check_value OUTPUT_MODE '^(both|type|clipboard)$' "both"
+  check_value TRAILING_SPACE '^(true|false)$' "true"
+  check_value NOTIFY '^(true|false)$' "true"
+  check_value MIN_DURATION_MS '^[0-9]+$' "400"
+  check_value SILENCE_THRESHOLD_DB '^-?[0-9]+([.][0-9]+)?$' "-50"
+  check_value WAYBAR_SIGNAL '^[0-9]+$' "11"
+  check_value PTT_KEY '^[A-Za-z0-9_]*$' "Control_L"
+  check_value PTT_MODS '^[A-Za-z_ ]*$' ""
+  check_value TOGGLE_KEY '^[A-Za-z0-9_]*$' "D"
+  check_value TOGGLE_MODS '^[A-Za-z_ ]*$' "SUPER ALT"
+  return 0
+}
+
+load_config() {
+  local line key value lineno=0
+  if [[ -r $CONFIG_FILE ]]; then
+    while IFS= read -r line || [[ -n $line ]]; do
+      lineno=$((lineno + 1))
+      line=$(trim "$line")
+      if [[ -z $line || $line == \#* ]]; then
+        continue
+      fi
+      if [[ ! $line =~ ^([A-Z_]+)=(.*)$ ]]; then
+        warn "config line $lineno ignored (expected KEY=value)"
+        continue
+      fi
+      key=${BASH_REMATCH[1]}
+      value=$(unquote "${BASH_REMATCH[2]}")
+      if ! is_known_key "$key"; then
+        warn "config line $lineno: unknown key '$key' ignored"
+        continue
+      fi
+      printf -v "$key" '%s' "$value"
+    done < "$CONFIG_FILE"
+  fi
+  validate_config
+}
+
+write_default_config() {
+  local k
+  mkdir -p -m 700 "$CONFIG_DIR"
+  {
+    echo "# dictarchy configuration - KEY=value per line, see README.md"
+    for k in "${CONFIG_KEYS[@]}"; do
+      printf '%s="%s"\n' "$k" "${!k}"
+    done
+  } > "$CONFIG_FILE"
+}
+
+config_set() {  # KEY VALUE - replaces the line or appends it
+  local key=$1 value=$2 tmp line found=0
+  tmp=$(mktemp "$CONFIG_DIR/config.XXXXXX")
+  while IFS= read -r line || [[ -n $line ]]; do
+    if [[ $line == "$key="* ]]; then
+      printf '%s="%s"\n' "$key" "$value"
+      found=1
+    else
+      printf '%s\n' "$line"
+    fi
+  done < "$CONFIG_FILE" > "$tmp"
+  if (( ! found )); then
+    printf '%s="%s"\n' "$key" "$value" >> "$tmp"
+  fi
+  mv -f -- "$tmp" "$CONFIG_FILE"
+}
+
+current_language() {
+  local value
+  value=$(trim "$(read_file "$LANG_FILE")")
+  if [[ -n $value && $value =~ ^([a-z]{2,3}|auto)$ ]]; then
+    printf '%s' "$value"
+  else
+    printf '%s' "$LANGUAGE"
+  fi
+}
+
+# ---------------------------------------------------------------------------
+# API key (never in argv, logs or notifications)
+# ---------------------------------------------------------------------------
+resolve_api_key() {
+  local mode
+  API_KEY=""
+  if [[ -n ${DICTARCHY_API_KEY:-} ]]; then
+    API_KEY=$DICTARCHY_API_KEY
+  elif [[ -n ${GROQ_API_KEY:-} ]]; then
+    API_KEY=$GROQ_API_KEY
+  elif [[ -f $API_KEY_FILE ]]; then
+    mode=$(stat -c '%a' "$API_KEY_FILE" 2>/dev/null || echo 600)
+    if (( 8#$mode & 077 )); then
+      warn "permissions of $API_KEY_FILE are $mode, expected 600 (chmod 600 $API_KEY_FILE)"
+    fi
+    API_KEY=$(<"$API_KEY_FILE")
+    API_KEY=$(trim "${API_KEY//$'\n'/}")
+  fi
+}
+
+save_api_key() {  # KEY - written with umask 077, then chmod 600
+  local tmp="$API_KEY_FILE.tmp.$$"
+  mkdir -p -m 700 "$CONFIG_DIR"
+  ( umask 077; printf '%s\n' "$1" > "$tmp" )
+  chmod 600 "$tmp"
+  mv -f -- "$tmp" "$API_KEY_FILE"
+}
+
+# ---------------------------------------------------------------------------
+# Recording state
+# ---------------------------------------------------------------------------
+set_state() {  # caller holds the lock
+  printf '%s\n' "$1" > "$STATE_FILE"
+}
+
+# Effective state as seen by status/start/toggle: stale entries are ignored.
+effective_state() {
+  local raw pid age
+  raw=$(read_file "$STATE_FILE")
+  case $raw in
+    recording)
+      pid=$(read_file "$PID_FILE")
+      if pid_alive "$pid"; then echo recording; else echo idle; fi ;;
+    transcribing)
+      age=$(file_age "$STATE_FILE")
+      if (( age < TRANSCRIBING_TIMEOUT )); then echo transcribing; else echo idle; fi ;;
+    error)
+      age=$(file_age "$STATE_FILE")
+      if (( age < ERROR_TIMEOUT )); then echo error; else echo idle; fi ;;
+    *) echo idle ;;
+  esac
+}
+
+cleanup_session() {  # caller holds the lock
+  rm -f -- "$PID_FILE" "$START_FILE" "$SESSION_FILE" "$SHOWN_FILE" "$MODE_FILE"
+}
+
+discard_recording() {  # caller holds the lock
+  rm -f -- "$WAV_FILE"
+  cleanup_session
+  set_state idle
+}
+
+cleanup_tmp() {  # EXIT trap: temporary audio and response of this process only
+  rm -f -- "$RUN_DIR/job-$$."* "$RUN_DIR/resp-$$.txt" 2>/dev/null || true
+}
+
+# Ask a running pw-record to finish: SIGINT (finalizes the WAV), then SIGTERM.
+stop_recorder() {  # PID
+  local pid=$1 i
+  if ! pid_alive "$pid"; then return 0; fi
+  kill -INT "$pid" 2>/dev/null || true
+  for (( i = 0; i < STOP_WAIT_TENTHS; i++ )); do
+    pid_alive "$pid" || return 0
+    sleep 0.1
+  done
+  log_line "pw-record did not exit after SIGINT, sending SIGTERM"
+  kill -TERM "$pid" 2>/dev/null || true
+  sleep 0.3
+}
+
+# ---------------------------------------------------------------------------
+# Start / stop / reveal. Both do_* functions expect the lock to be held and
+# always release it before returning.
+# ---------------------------------------------------------------------------
+do_start_locked() {  # PTT_FLAG
+  local ptt=$1 sid pid secs
+  case $(effective_state) in
+    recording)
+      release_lock
+      return 0 ;;
+    transcribing)
+      release_lock
+      if (( ! ptt )); then notify_user "Still transcribing - please wait"; fi
+      return 0 ;;
+  esac
+
+  if ! have pw-record; then
+    release_lock
+    notify_user -f "pw-record not found - install pipewire"
+    return 1
+  fi
+
+  # Press and release events start two processes at nearly the same time. If the
+  # release won the race for the lock, it left a marker: honour it and do not
+  # start a recording that no release event would ever stop.
+  if (( ptt )) && [[ -f $RELEASED_FILE ]]; then
+    local released
+    released=$(read_file "$RELEASED_FILE")
+    rm -f -- "$RELEASED_FILE"
+    if [[ $released =~ ^[0-9]+$ ]] && (( $(now_ms) - released < EARLY_RELEASE_MS )); then
+      release_lock
+      log_line "start: push-to-talk key already released, not recording"
+      return 0
+    fi
+  fi
+  rm -f -- "$WAV_FILE" "$SHOWN_FILE" "$RELEASED_FILE"
+  sid="$(now_ms)-$$"
+  # Background jobs of a non-interactive shell start with SIGINT ignored, and that
+  # disposition is inherited by pw-record, so it would ignore our stop signal.
+  # env --default-signal resets it before exec (coreutils >= 8.31).
+  local -a launcher=(setsid)
+  if env --default-signal=INT true 2>/dev/null; then
+    launcher=(env --default-signal=INT,QUIT,TERM setsid)
+  fi
+  "${launcher[@]}" pw-record --rate 16000 --channels 1 --format s16 "$WAV_FILE" \
+    </dev/null >> "$LOG_FILE" 2>&1 9>&- &
+  pid=$!
+  printf '%s\n' "$pid" > "$PID_FILE"
+  printf '%s\n' "$sid" > "$SESSION_FILE"
+  now_ms > "$START_FILE"
+  if (( ptt )); then echo ptt > "$MODE_FILE"; else echo toggle > "$MODE_FILE"; fi
+  set_state recording
+  if (( ! ptt )); then
+    touch "$SHOWN_FILE"
+  fi
+  log_line "recording started (ptt=$ptt)"
+  release_lock
+
+  if (( ptt )); then
+    if (( MIN_DURATION_MS == 0 )); then
+      reveal_session "$sid"
+    else
+      # Show "recording" only if the key is still held after MIN_DURATION_MS.
+      printf -v secs '%d.%03d' $((MIN_DURATION_MS / 1000)) $((MIN_DURATION_MS % 1000))
+      ( sleep "$secs"; "$SELF" _reveal "$sid" ) </dev/null >/dev/null 2>&1 9>&- &
+    fi
+  else
+    notify_user "Recording..."
+    refresh_waybar
+  fi
+}
+
+reveal_session() {  # SESSION_ID - used by the push-to-talk delay
+  acquire_lock
+  if [[ $(effective_state) == recording && $(read_file "$SESSION_FILE") == "$1" && ! -e $SHOWN_FILE ]]; then
+    touch "$SHOWN_FILE"
+    notify_user "Recording..."
+    refresh_waybar
+  fi
+  release_lock
+}
+
+is_silent() {  # WAV - true when the peak level is below SILENCE_THRESHOLD_DB
+  have ffmpeg || return 1
+  local peak
+  peak=$(ffmpeg -hide_banner -nostats -i "$1" -af volumedetect -f null - 2>&1 \
+    | sed -n 's/.*max_volume: \([^ ]*\) dB.*/\1/p' | head -n 1 || true)
+  if [[ -z $peak ]]; then return 1; fi
+  if [[ $peak == -inf ]]; then return 0; fi
+  awk -v p="$peak" -v t="$SILENCE_THRESHOLD_DB" 'BEGIN { exit !(p + 0 < t + 0) }'
+}
+
+do_stop_locked() {  # PTT_FLAG
+  local ptt=$1 start_ms dur_ms job
+  if [[ $(read_file "$STATE_FILE") != recording ]]; then
+    # A push-to-talk release that arrives before its press: remember it, so the
+    # late start does not leave a recording running (see do_start_locked).
+    if (( ptt )); then now_ms > "$RELEASED_FILE"; fi
+    release_lock
+    return 0
+  fi
+  # Releasing the push-to-talk key (e.g. after Ctrl+C) must not end a recording
+  # that was started with the toggle hotkey.
+  if (( ptt )) && [[ $(read_file "$MODE_FILE") == toggle ]]; then
+    release_lock
+    return 0
+  fi
+
+  stop_recorder "$(read_file "$PID_FILE")"
+
+  start_ms=$(read_file "$START_FILE")
+  if [[ ! $start_ms =~ ^[0-9]+$ ]]; then start_ms=0; fi
+  dur_ms=$(( $(now_ms) - start_ms ))
+
+  if [[ ! -s $WAV_FILE ]]; then
+    log_line "stop: no audio file was produced"
+    discard_recording
+    release_lock
+    refresh_waybar
+    if (( ! ptt )); then notify_user -f "No audio was recorded - check pw-record"; fi
+    return 1
+  fi
+
+  if (( dur_ms < MIN_DURATION_MS )); then
+    log_line "stop: discarded short recording (${dur_ms} ms)"
+    discard_recording
+    release_lock
+    refresh_waybar
+    return 0
+  fi
+
+  if is_silent "$WAV_FILE"; then
+    log_line "stop: discarded silent recording (${dur_ms} ms)"
+    discard_recording
+    release_lock
+    refresh_waybar
+    if (( ! ptt || dur_ms >= LONG_RECORDING_MS )); then notify_user "No speech detected"; fi
+    return 0
+  fi
+
+  job="$RUN_DIR/job-$$.wav"
+  mv -f -- "$WAV_FILE" "$job"
+  if have ffmpeg; then
+    if ffmpeg -hide_banner -loglevel error -y -i "$job" -c:a flac "$RUN_DIR/job-$$.flac" 2>>"$LOG_FILE" \
+       && [[ -s $RUN_DIR/job-$$.flac ]]; then
+      rm -f -- "$job"
+      job="$RUN_DIR/job-$$.flac"
+    else
+      log_line "stop: FLAC compression failed, sending WAV"
+      rm -f -- "$RUN_DIR/job-$$.flac"
+    fi
+  fi
+
+  cleanup_session
+  set_state transcribing
+  log_line "stop: recording ${dur_ms} ms, transcribing"
+  release_lock
+  refresh_waybar
+  process_job "$job" "$dur_ms"
+}
+
+# ---------------------------------------------------------------------------
+# Transcription and output (runs without the lock)
+# ---------------------------------------------------------------------------
+error_message() {  # RESPONSE_FILE
+  local msg=""
+  if have jq; then
+    msg=$(jq -r '.error.message // empty' "$1" 2>/dev/null || true)
+  fi
+  if [[ -z $msg ]]; then
+    msg=$(tr '\r\n' '  ' < "$1" 2>/dev/null || true)
+  fi
+  msg=$(trim "$msg")
+  printf '%.200s' "$msg"
+}
+
+finish_idle() {
+  acquire_lock
+  if [[ $(read_file "$STATE_FILE") == transcribing ]]; then
+    set_state idle
+  fi
+  release_lock
+  refresh_waybar
+}
+
+fail() {  # MESSAGE - shows an error briefly, then returns to idle
+  log_line "error: $*"
+  acquire_lock
+  set_state error
+  release_lock
+  refresh_waybar
+  notify_user -f "$*"
+  sleep "$ERROR_HOLD_SECONDS"
+  acquire_lock
+  if [[ $(read_file "$STATE_FILE") == error ]]; then
+    set_state idle
+  fi
+  release_lock
+  refresh_waybar
+}
+
+deliver_text() {  # TEXT - writes to the clipboard and/or types it
+  local text=$1 typed
+  local do_type=0 do_clip=0
+  case $OUTPUT_MODE in
+    both) do_type=1; do_clip=1 ;;
+    type) do_type=1 ;;
+    clipboard) do_clip=1 ;;
+  esac
+
+  if (( do_type )) && ! have wtype; then
+    notify_user "wtype not found - copying to clipboard instead"
+    do_type=0
+    do_clip=1
+  fi
+  if (( do_clip )) && ! have wl-copy; then
+    notify_user "wl-copy not found - clipboard skipped"
+    do_clip=0
+    if (( ! do_type )) && have wtype; then do_type=1; fi
+  fi
+  if (( ! do_type && ! do_clip )); then
+    fail "No output tool found - install wtype and wl-clipboard"
+    return 1
+  fi
+
+  if (( do_clip )); then
+    if printf '%s' "$text" | wl-copy 2>>"$LOG_FILE"; then  # stdin: not in argv
+      log_line "text copied to clipboard"
+    else
+      notify_user -f "Clipboard copy failed"
+    fi
+  fi
+  if (( do_type )); then
+    typed=$text
+    if [[ $TRAILING_SPACE == true ]]; then typed+=" "; fi
+    if wtype -- "$typed" 2>>"$LOG_FILE"; then
+      log_line "text typed"
+    else
+      notify_user -f "Typing failed - is a Wayland session running?"
+    fi
+  fi
+}
+
+process_job() {  # JOB_FILE AUDIO_MS
+  local job=$1 audio_ms=$2
+  local resp="$RUN_DIR/resp-$$.txt" req_start code="" rc=0 text msg lang esc
+  local -a extra=()
+
+  resolve_api_key
+  if [[ -z $API_KEY ]]; then
+    fail "No API key - run dictarchy setup"
+    return 1
+  fi
+
+  lang=$(current_language)
+  # --form-string: plain -F would read a file if a value started with @ or <.
+  if [[ $lang != auto ]]; then extra+=(--form-string "language=$lang"); fi
+  if [[ -n $PROMPT ]]; then extra+=(--form-string "prompt=$PROMPT"); fi
+
+  # The key goes to curl via a config on stdin, never via argv.
+  esc=$API_KEY
+  esc=${esc//\\/\\\\}
+  esc=${esc//\"/\\\"}
+
+  : > "$resp"
+  req_start=$(now_ms)
+  code=$(printf 'header = "Authorization: Bearer %s"\n' "$esc" | curl -sS --max-time 60 \
+    -o "$resp" -w '%{http_code}' -K - \
+    -F "file=@$job" --form-string "model=$MODEL" -F response_format=text -F temperature=0 \
+    "${extra[@]}" "$API_BASE_URL/audio/transcriptions" 2>>"$LOG_FILE") || rc=$?
+  esc=""
+  API_KEY=""
+
+  if (( rc != 0 )); then
+    log_line "curl failed (exit $rc)"
+    fail "Network error - API not reachable"
+    return 1
+  fi
+  log_line "transcription http=$code audio_ms=$audio_ms request_ms=$(( $(now_ms) - req_start ))"
+
+  case $code in
+    200)
+      text=$(trim "$(cat "$resp")")
+      if [[ -z $text ]]; then
+        notify_user "Nothing recognized"
+        finish_idle
+        return 0
+      fi
+      deliver_text "$text"
+      finish_idle
+      return 0 ;;
+    401|403)
+      fail "Invalid API key - run dictarchy setup"
+      return 1 ;;
+    413)
+      fail "Audio file too large"
+      return 1 ;;
+    429)
+      fail "Rate limited - try again later"
+      return 1 ;;
+    *)
+      msg=$(error_message "$resp")
+      fail "API error $code${msg:+: $msg}"
+      return 1 ;;
+  esac
+}
+
+# ---------------------------------------------------------------------------
+# Commands
+# ---------------------------------------------------------------------------
+parse_ptt_flag() {
+  local arg
+  PTT_MODE=0
+  for arg in "$@"; do
+    case $arg in
+      --ptt) PTT_MODE=1 ;;
+      *) usage_error "unknown option: $arg" ;;
+    esac
+  done
+}
+
+cmd_start() {
+  parse_ptt_flag "$@"
+  ensure_dirs
+  acquire_lock
+  do_start_locked "$PTT_MODE"
+}
+
+cmd_stop() {
+  parse_ptt_flag "$@"
+  ensure_dirs
+  acquire_lock
+  do_stop_locked "$PTT_MODE"
+}
+
+cmd_toggle() {
+  (( $# == 0 )) || usage_error "toggle takes no arguments"
+  ensure_dirs
+  acquire_lock
+  case $(effective_state) in
+    recording) do_stop_locked 0 ;;
+    transcribing)
+      release_lock
+      notify_user "Still transcribing - please wait" ;;
+    *) do_start_locked 0 ;;
+  esac
+}
+
+cmd_cancel() {
+  ensure_dirs
+  acquire_lock
+  if [[ $(read_file "$STATE_FILE") != recording ]]; then
+    release_lock
+    echo "Nothing to cancel."
+    return 0
+  fi
+  stop_recorder "$(read_file "$PID_FILE")"
+  rm -f -- "$WAV_FILE"
+  cleanup_session
+  set_state idle
+  release_lock
+  log_line "recording cancelled"
+  refresh_waybar
+  notify_user "Recording cancelled"
+}
+
+cmd_status() {
+  local st icon cls lang text tooltip
+  st=$(effective_state)
+  if [[ $st == recording && ! -e $SHOWN_FILE ]]; then
+    st=idle  # push-to-talk: stay quiet until the press lasts MIN_DURATION_MS
+  fi
+  case $st in
+    recording) icon=$ICON_MIC ;;
+    transcribing) icon=$ICON_BUSY ;;
+    error) icon=$ICON_MIC_ERROR ;;
+    *) st=idle; icon=$ICON_MIC ;;
+  esac
+  cls=$st
+  lang=$(current_language)
+  lang=${lang^^}
+  text="$icon $lang"
+  tooltip="dictarchy: $st\nLanguage: $lang\nPush-to-talk: $(hotkey_label "$PTT_MODS" "$PTT_KEY") (hold)\nToggle: $(hotkey_label "$TOGGLE_MODS" "$TOGGLE_KEY")\nLeft-click: toggle, right-click: next language"
+  printf '{"text":"%s","tooltip":"%s","class":"%s","alt":"%s"}\n' \
+    "$(json_escape "$text")" "$(json_escape "$tooltip")" "$cls" "$cls"
+}
+
+cmd_lang() {
+  local arg=${1:-} current new i idx
+  local -a langs=()
+  current=$(current_language)
+  if [[ -z $arg ]]; then
+    printf '%s\n' "$current"
+    return 0
+  fi
+  (( $# == 1 )) || usage_error "lang takes one argument: next or a language code"
+
+  case $arg in
+    next)
+      read -r -a langs <<< "$LANGUAGES"
+      (( ${#langs[@]} > 0 )) || die "LANGUAGES is empty in the config"
+      new=${langs[0]}
+      for (( i = 0; i < ${#langs[@]}; i++ )); do
+        if [[ ${langs[i]} == "$current" ]]; then
+          idx=$(( (i + 1) % ${#langs[@]} ))
+          new=${langs[idx]}
+          break
+        fi
+      done
+      ;;
+    *)
+      new=${arg,,}
+      [[ $new =~ ^([a-z]{2,3}|auto)$ ]] || usage_error "invalid language code: $arg"
+      ;;
+  esac
+
+  ensure_dirs
+  printf '%s\n' "$new" > "$LANG_FILE"
+  log_line "language set to $new"
+  refresh_waybar
+  notify_user "Language: ${new^^}"
+  printf '%s\n' "$new"
+}
+
+prompt_value() {  # LABEL CURRENT REGEX -> sets ANSWER; "none" clears, empty keeps
+  local answer
+  read -r -p "$1 [${2:-none}]: " answer || true
+  answer=$(trim "$answer")
+  case $answer in
+    '') ANSWER=$2 ;;
+    none) ANSWER="" ;;
+    *)
+      if [[ $answer =~ $3 ]]; then
+        ANSWER=$answer
+      else
+        die "invalid value: $answer"
+      fi ;;
+  esac
+}
+
+cmd_setup() {
+  local key="" ANSWER=""
+  mkdir -p -m 700 "$CONFIG_DIR"
+  if [[ ! -f $CONFIG_FILE ]]; then write_default_config; fi
+
+  echo "dictarchy setup - press Enter to keep the current value."
+  read -r -s -p "Groq API key (input hidden): " key || true
+  echo
+  key=$(trim "$key")
+  if [[ -n $key ]]; then
+    save_api_key "$key"
+    echo "API key saved to $API_KEY_FILE (permissions 600)."
+  fi
+  key=""
+
+  prompt_value "Push-to-talk key, e.g. Control_L (\"none\" disables)" "$PTT_KEY" '^[A-Za-z0-9_]+$'
+  config_set PTT_KEY "$ANSWER"
+  prompt_value "Push-to-talk modifiers, e.g. SUPER (\"none\" for none)" "$PTT_MODS" '^[A-Za-z_]+( [A-Za-z_]+)*$'
+  config_set PTT_MODS "$ANSWER"
+  prompt_value "Toggle key, e.g. D (\"none\" disables)" "$TOGGLE_KEY" '^[A-Za-z0-9_]+$'
+  config_set TOGGLE_KEY "$ANSWER"
+  prompt_value "Toggle modifiers, e.g. SUPER ALT (\"none\" for none)" "$TOGGLE_MODS" '^[A-Za-z_]+( [A-Za-z_]+)*$'
+  config_set TOGGLE_MODS "$ANSWER"
+
+  load_config
+  echo "Config saved to $CONFIG_FILE."
+  cmd_bindings
+}
+
+cmd_bindings() {
+  local tmp="$BINDINGS_FILE.tmp" extra release_mods
+  mkdir -p -- "$HYPR_DIR"
+  {
+    echo "# managed by dictarchy, edit config instead"
+    echo "# Edit ~/.config/dictarchy/config, then run: dictarchy bindings"
+    if [[ -n $PTT_KEY ]]; then
+      extra=$(modifier_for_key "$PTT_KEY")
+      release_mods=$(merge_mods "$PTT_MODS" "$extra")
+      echo ""
+      echo "# Push-to-talk: hold to record, release to transcribe."
+      echo "# bindn/bindrn are non-consuming, so the key still reaches applications."
+      if [[ -n $extra ]]; then
+        echo "# $PTT_KEY is a modifier key: on release Hyprland reports it in the modifier"
+        echo "# mask, so the release bind adds $extra."
+      fi
+      printf 'bindn = %s, %s, exec, %s start --ptt\n' "$PTT_MODS" "$PTT_KEY" "$SELF"
+      printf 'bindrn = %s, %s, exec, %s stop --ptt\n' "$release_mods" "$PTT_KEY" "$SELF"
+    fi
+    if [[ -n $TOGGLE_KEY ]]; then
+      echo ""
+      echo "# Toggle: press once to start recording, press again to stop."
+      printf 'bindd = %s, %s, Dictarchy toggle dictation, exec, %s toggle\n' \
+        "$TOGGLE_MODS" "$TOGGLE_KEY" "$SELF"
+    fi
+  } > "$tmp"
+  mv -f -- "$tmp" "$BINDINGS_FILE"
+  echo "Wrote $BINDINGS_FILE"
+
+  if have hyprctl; then
+    hyprctl reload >/dev/null 2>&1 || warn "hyprctl reload failed"
+  else
+    echo "hyprctl not found - reload Hyprland manually."
+  fi
+}
+
+cmd_waybar() {
+  # Absolute paths: Waybar does not necessarily have ~/.local/bin on its PATH.
+  cat <<EOF
+// Add "custom/dictarchy" to modules-right in ~/.config/waybar/config.jsonc,
+// then paste this module definition. "signal" must match WAYBAR_SIGNAL.
+"custom/dictarchy": {
+    "exec": "$SELF status",
+    "return-type": "json",
+    "interval": "once",
+    "signal": $WAYBAR_SIGNAL,
+    "on-click": "$SELF toggle",
+    "on-click-right": "$SELF lang next",
+    "tooltip": true
+}
+EOF
+  cat <<'EOF'
+
+/* Paste into ~/.config/waybar/style.css */
+#custom-dictarchy {
+    padding: 0 10px;
+}
+
+#custom-dictarchy.recording {
+    color: #f38ba8;
+}
+
+#custom-dictarchy.transcribing {
+    color: #f9e2af;
+}
+
+#custom-dictarchy.error {
+    color: #fab387;
+}
+EOF
+}
+
+cmd_help() {
+  cat <<EOF
+dictarchy $VERSION - speech-to-text via API, triggered by hotkeys
+
+Usage: dictarchy <command> [options]
+
+Recording:
+  start [--ptt]     start recording (--ptt: push-to-talk, hidden for short taps)
+  stop [--ptt]      stop recording and transcribe the audio
+  toggle            start if idle, stop if recording
+  cancel            stop recording and discard the audio
+
+Information and settings:
+  status            print Waybar JSON (text, tooltip, class, alt)
+  lang [next|CODE]  print the current language, cycle to the next one, or set one
+  bindings          regenerate the Hyprland bindings and reload Hyprland
+  setup             interactive: API key and hotkeys, then regenerate bindings
+  waybar            print the Waybar module and CSS snippets
+
+  version           print the version
+  help              show this help
+
+Files:
+  config   $CONFIG_FILE
+  api key  $API_KEY_FILE
+  log      $LOG_FILE
+EOF
+}
+
+main() {
+  local cmd=${1:-help}
+  trap cleanup_tmp EXIT
+  load_config
+  if (( $# > 0 )); then shift; fi
+
+  case $cmd in
+    start) cmd_start "$@" ;;
+    stop) cmd_stop "$@" ;;
+    toggle) cmd_toggle "$@" ;;
+    cancel) cmd_cancel ;;
+    status) cmd_status ;;
+    lang) cmd_lang "$@" ;;
+    setup) cmd_setup ;;
+    bindings) cmd_bindings ;;
+    waybar) cmd_waybar ;;
+    version|--version|-V) echo "dictarchy $VERSION" ;;
+    help|-h|--help) cmd_help ;;
+    _reveal) reveal_session "${1:?session id missing}" ;;  # internal: push-to-talk delay
+    *) usage_error "unknown command: $cmd (see: dictarchy help)" ;;
+  esac
+}
+
+main "$@"
