@@ -3,6 +3,17 @@
 All notable changes to this project are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [0.4.0] - 2026-11-15
+
+### Changed
+
+- Push-to-talk defaults to Left Alt (`PTT_KEY="Alt_L"`) instead of Left Ctrl. Existing
+  configurations keep their key.
+
+### Added
+
+- Left Alt as a push-to-talk preset in the settings menu.
+
 ## [0.3.0] - 2026-11-15
 
 ### Added
