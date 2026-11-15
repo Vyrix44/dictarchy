@@ -3,6 +3,27 @@
 All notable changes to this project are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [0.3.0] - 2026-11-15
+
+### Added
+
+- Installation with Omarchy's plugin manager:
+  `omarchy plugin add https://github.com/Vyrix44/dictarchy.git --enable`, updates with
+  `omarchy plugin update`. The repository root is now the plugin folder (`manifest.json`, QML and
+  `i18n/` moved out of `plugin/`).
+- After `omarchy plugin add` the icon shows "Setup needed" until the hotkeys are set up; clicking it
+  runs `install.sh --setup` in a floating terminal, which finishes the setup and asks for the API key.
+- `install.sh --setup`.
+
+### Changed
+
+- The widget calls the `bin/dictarchy` in its plugin folder instead of `~/.local/bin/dictarchy`,
+  which is now a symlink to it.
+- `install.sh` copies the plugin only when it runs from another checkout, and leaves a plugin folder
+  that `omarchy plugin add` cloned alone.
+- `uninstall.sh` unloads the plugin from the running shell before deleting its folder.
+- `~/.config/hypr/dictarchy.lua` skips its binds when the dictarchy command no longer exists.
+
 ## [0.2.0] - 2026-11-15
 
 Rewritten for Omarchy 4.5: Hyprland Lua config, the Quickshell-based Omarchy shell

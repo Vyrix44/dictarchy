@@ -2,7 +2,8 @@
 # uninstall.sh - removes dictarchy from the current user's account.
 #
 # Removes (after backups of every edited file): the bar entry in
-# ~/.config/omarchy/shell.json, the bar widget, the marked block in
+# ~/.config/omarchy/shell.json, the plugin folder (also one added with
+# "omarchy plugin add"), the marked block in
 # ~/.config/hypr/hyprland.lua, ~/.config/hypr/dictarchy.lua,
 # ~/.local/bin/dictarchy and the runtime directory. The config directory (it
 # holds the API key) and the state directory (log, language) are kept unless
@@ -103,8 +104,14 @@ remove_files() {
     fi
   done
   if [[ -d $PLUGIN_DIR ]]; then
+    # Unload it first; the shell forgets the folder on the rescan below.
+    if have omarchy-shell; then
+      omarchy-shell shell setPluginEnabled "$PLUGIN_ID" false >/dev/null 2>&1 || true
+    fi
+    # Also when this script runs from that folder: bash keeps reading it from the open file.
     rm -rf -- "$PLUGIN_DIR"
     echo "  removed $PLUGIN_DIR"
+    if have omarchy-shell; then omarchy-shell shell rescanPlugins >/dev/null 2>&1 || true; fi
   fi
   if [[ -d $RUN_DIR ]]; then
     if [[ -f $RUN_DIR/pid ]]; then kill "$(cat "$RUN_DIR/pid")" 2>/dev/null || true; fi

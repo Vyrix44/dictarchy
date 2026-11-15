@@ -221,20 +221,20 @@ if command -v shellcheck >/dev/null 2>&1; then
 else
   skip "shellcheck not installed"
 fi
-for json in "$REPO/plugin/manifest.json" "$REPO/plugin/i18n/"*.json; do
+for json in "$REPO/manifest.json" "$REPO/i18n/"*.json; do
   check "valid JSON: ${json#"$REPO/"}" jq -e . "$json"
 done
-check "de.json has every key of en.json" bash -c "diff <(jq -r 'keys[]' '$REPO/plugin/i18n/en.json') <(jq -r 'keys[]' '$REPO/plugin/i18n/de.json') >/dev/null"
+check "de.json has every key of en.json" bash -c "diff <(jq -r 'keys[]' '$REPO/i18n/en.json') <(jq -r 'keys[]' '$REPO/i18n/de.json') >/dev/null"
 QMLFORMAT=$(command -v qmlformat || echo /usr/lib/qt6/bin/qmlformat)
 if [[ -x $QMLFORMAT ]]; then
-  for qml in "$REPO/plugin/"*.qml; do
+  for qml in "$REPO/"*.qml; do
     check "$(basename "$qml") parses (qmlformat)" "$QMLFORMAT" "$qml"
   done
 else
   skip "qmlformat not installed"
 fi
-check "plugin passes omarchy plugin validate" omarchy-plugin-validate "$REPO/plugin"
-check "manifest declares the overlay service" test "$(jq -c '[.kinds, .entryPoints.service]' "$REPO/plugin/manifest.json")" = '[["bar-widget","service"],"Service.qml"]'
+check "plugin passes omarchy plugin validate" omarchy-plugin-validate "$REPO"
+check "manifest declares the overlay service" test "$(jq -c '[.kinds, .entryPoints.service]' "$REPO/manifest.json")" = '[["bar-widget","service"],"Service.qml"]'
 if command -v node >/dev/null 2>&1; then
   node -e '
     const fs = require("fs"); const vm = require("vm");
@@ -244,7 +244,7 @@ if command -v node >/dev/null 2>&1; then
     const bad = [ "not json", JSON.stringify({state:"pwned"}), JSON.stringify({state:"idle",language:"<img src=x>"}) ].map(ctx.parse);
     if (!ok || ok.state !== "recording" || ok.overlay !== false || ok.language !== "de") process.exit(1);
     if (bad[0] !== null || bad[1] !== null || bad[2].language !== "") process.exit(2);
-  ' "$REPO/plugin/StatusModel.js"
+  ' "$REPO/StatusModel.js"
   check "StatusModel.js accepts valid status and rejects markup and unknown states" test "$?" = "0"
 else
   skip "node not installed (StatusModel.js check)"
@@ -707,15 +707,47 @@ STUB_OMARCHY_VERSION=3.1.0 "$REPO/install.sh" </dev/null > "$TMP/install-old.txt
 check "install refuses Omarchy 3.x" bash -c "test $? != 0 && grep -q 'needs Omarchy 4.5' '$TMP/install-old.txt'"
 
 # ---------------------------------------------------------------------------
+echo "== omarchy plugin add (repository cloned as the plugin folder)"
+# ---------------------------------------------------------------------------
+reset_env
+mkdir -p "$XDG_CONFIG_HOME/hypr" "$XDG_CONFIG_HOME/omarchy/plugins"
+echo 'require("hypr.bindings")' > "$XDG_CONFIG_HOME/hypr/hyprland.lua"
+echo '{"bar":{"layout":{"right":[{"id":"omarchy.audio"}]}},"version":1}' > "$XDG_CONFIG_HOME/omarchy/shell.json"
+PLUGIN_DIR="$XDG_CONFIG_HOME/omarchy/plugins/io.github.vyrix44.dictarchy"
+# What "omarchy plugin add" leaves behind: the working tree plus .git.
+cp -r "$REPO" "$PLUGIN_DIR"
+mkdir -p "$PLUGIN_DIR/.git"
+check "the repository root passes omarchy plugin validate" omarchy-plugin-validate "$PLUGIN_DIR"
+PDICT="$PLUGIN_DIR/bin/dictarchy"
+check "plugin added: status is 'setup' although a key is set (no hotkeys yet)" \
+  test "$("$PDICT" status | jq -r .state)" = "setup"
+"$PDICT" setup </dev/null; wait_for "$LOGS/terminal.log"
+check "setup click runs install.sh --setup in a floating terminal" \
+  grep -qF -- "-e $PLUGIN_DIR/install.sh --setup" "$LOGS/terminal.log"
+"$PLUGIN_DIR/install.sh" --setup </dev/null > "$TMP/install-plugin.txt" 2>&1
+check "install.sh from the plugin folder: exits successfully" test "$?" = "0"
+check "install.sh from the plugin folder: keeps the git checkout" test -d "$PLUGIN_DIR/.git"
+check "install.sh from the plugin folder: ~/.local/bin/dictarchy links to it" \
+  test "$(readlink "$HOME/.local/bin/dictarchy")" = "$PDICT"
+check "install.sh from the plugin folder: hotkeys call the plugin's command" grep -qF "$PDICT" "$BIND_FILE"
+check "after setup: status is no longer 'setup'" test "$("$PDICT" status | jq -r .state)" = "idle"
+"$REPO/install.sh" </dev/null > "$TMP/install-over-git.txt" 2>&1
+check "install.sh from another checkout leaves a git-managed plugin alone" \
+  bash -c "test -d '$PLUGIN_DIR/.git' && grep -q 'managed by omarchy plugin' '$TMP/install-over-git.txt'"
+"$PLUGIN_DIR/uninstall.sh" --yes > "$TMP/uninstall-plugin.txt" 2>&1
+check "uninstall.sh from the plugin folder removes it" test ! -e "$PLUGIN_DIR"
+check "uninstall.sh unloads the plugin from the shell" grep -qF "setPluginEnabled io.github.vyrix44.dictarchy false" "$LOGS/omarchy-shell.log"
+
+# ---------------------------------------------------------------------------
 echo "== misc"
 # ---------------------------------------------------------------------------
 reset_env
 check "cancel while idle is a no-op" test "$("$DICT" cancel)" = "Nothing to cancel."
 "$DICT" start --bogus >/dev/null 2>&1
 check "unknown option exits with status 2" test "$?" = "2"
-check "version" test "$("$DICT" version)" = "dictarchy 0.2.0"
+check "version" test "$("$DICT" version)" = "dictarchy 0.3.0"
 check "help lists the menu" bash -c "'$DICT' help | grep -q 'menu'"
-check "manifest version matches" test "$(jq -r .version "$REPO/plugin/manifest.json")" = "0.2.0"
+check "manifest version matches" test "$(jq -r .version "$REPO/manifest.json")" = "0.3.0"
 
 # ---------------------------------------------------------------------------
 echo

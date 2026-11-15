@@ -23,8 +23,11 @@ BarWidget {
 
   readonly property string home: Quickshell.env("HOME") || ""
   readonly property string runtimeDir: Quickshell.env("XDG_RUNTIME_DIR") || ""
-  // shell.json may override the command: { "id": "io.github.vyrix44.dictarchy", "command": "/path/to/dictarchy" }
-  readonly property string command: String(setting("command", home + "/.local/bin/dictarchy"))
+  // The CLI ships inside the plugin folder (omarchy plugin add clones the whole
+  // repository there, and install.sh copies it there). shell.json may override
+  // it: { "id": "io.github.vyrix44.dictarchy", "command": "/path/to/dictarchy" }
+  readonly property string bundledCommand: home + "/.config/omarchy/plugins/" + moduleName + "/bin/dictarchy"
+  readonly property string command: String(setting("command", bundledCommand))
   readonly property string statusPath: runtimeDir !== "" ? runtimeDir + "/dictarchy/status.json" : ""
 
   property string status: "idle"   // not "state": Item already has one

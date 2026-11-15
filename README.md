@@ -46,25 +46,51 @@ dictarchy is not installed system-wide and never runs `sudo` on its own.
 
 ## Installation
 
+With Omarchy's plugin manager:
+
+```sh
+omarchy plugin add https://github.com/Vyrix44/dictarchy.git --enable
+```
+
+It clones the repository to `~/.config/omarchy/plugins/io.github.vyrix44.dictarchy/`, checks it with
+`omarchy plugin validate`, asks where in the bar the widget goes (right by default) and enables it.
+The plugin manager only installs shell plugins, so the icon then shows **Setup needed**: click it once.
+A floating terminal runs the plugin's `install.sh --setup`, which sets up the hotkeys and the CLI
+(the steps below) and then asks for the API key.
+
+Updates and removal:
+
+```sh
+omarchy plugin update io.github.vyrix44.dictarchy                    # pulls and re-validates
+~/.config/omarchy/plugins/io.github.vyrix44.dictarchy/uninstall.sh    # see Uninstall
+```
+
+Coming from an older dictarchy that `install.sh` copied into the plugin folder? `omarchy plugin add`
+refuses an id that is already installed, so remove the copy first with `./uninstall.sh --yes`
+(it keeps your config and API key).
+
+Or by hand, from a checkout:
+
 ```sh
 git clone https://github.com/Vyrix44/dictarchy.git
 cd dictarchy
-./install.sh          # or ./install.sh --link to symlink the CLI for development
+./install.sh          # or ./install.sh --link to symlink the CLI to the checkout for development
 ```
 
-The installer does not ask for anything except missing packages. It:
+The installer does not ask for anything except missing packages (and, with `--setup`, the API key). It:
 
 1. checks the Omarchy version and the dependencies,
-2. copies `bin/dictarchy` to `~/.local/bin/dictarchy`,
-3. creates `~/.config/dictarchy/config` from `config/config.example` (an existing file is kept),
-4. copies the bar widget and overlay to `~/.config/omarchy/plugins/io.github.vyrix44.dictarchy/`
-   (and restarts the Omarchy shell when an update adds files to it, since the shell caches the file list),
+2. copies the plugin to `~/.config/omarchy/plugins/io.github.vyrix44.dictarchy/` (skipped when it runs
+   from there, and when that folder is a git checkout from `omarchy plugin add`; it restarts the Omarchy
+   shell when an update adds files, since the shell caches the file list),
+3. links `~/.local/bin/dictarchy` to the plugin's `bin/dictarchy`, so plugin updates update the command,
+4. creates `~/.config/dictarchy/config` from `config/config.example` (an existing file is kept),
 5. appends a block between `-- >>> dictarchy >>>` and `-- <<< dictarchy <<<` to
    `~/.config/hypr/hyprland.lua` that loads `~/.config/hypr/dictarchy.lua`, then writes that file
    and reloads Hyprland (warning about hotkey conflicts),
 6. adds `{"id": "io.github.vyrix44.dictarchy"}` to `bar.layout.right` in `~/.config/omarchy/shell.json`,
-   left of the volume icon. With the shell running this goes through `omarchy plugin enable`; otherwise
-   the file is edited with jq.
+   left of the volume icon, unless the widget is already in the bar. With the shell running this goes
+   through `omarchy plugin enable`; otherwise the file is edited with jq.
 
 Every file it edits is backed up first as `<file>.dictarchy-backup-<timestamp>`. Running it again is safe:
 the Hyprland block is found by its markers and the bar entry by its id (JSON has no comments, so
@@ -72,7 +98,7 @@ the Hyprland block is found by its markers and the bar entry by its id (JSON has
 
 ## Setup
 
-After installing, the bar icon shows **Setup needed**.
+After installing, the bar icon shows **Setup needed** until the hotkeys are set up and an API key is saved.
 
 1. Create a Groq account at <https://console.groq.com>, open *API Keys* and create a key.
 2. Click the dictarchy icon. A floating terminal opens and asks for the key; the input is hidden.
@@ -170,8 +196,8 @@ a "Recording..." notification marks the start of a recording instead.
 
 `dictarchy` writes its status as JSON to `$XDG_RUNTIME_DIR/dictarchy/status.json` on every change.
 The bar widget and the overlay service watch that file; the widget and also runs `dictarchy status --write` every 5 seconds, which catches
-stale states and keys added by hand. It calls `~/.local/bin/dictarchy`; set `"command"` on the widget's
-entry in `shell.json` to use another path.
+stale states and keys added by hand. It calls the `bin/dictarchy` inside its plugin folder; set `"command"`
+on the widget's entry in `shell.json` to use another path.
 
 ## Privacy
 
@@ -200,10 +226,14 @@ Start with **Test** in the menu (or `dictarchy test` in a terminal), then the lo
 ## Uninstall
 
 ```sh
-./uninstall.sh          # ./uninstall.sh --yes skips the questions and keeps config and log
+~/.config/omarchy/plugins/io.github.vyrix44.dictarchy/uninstall.sh   # or ./uninstall.sh in a checkout
+                                                                      # --yes skips the questions, keeps config and log
 ```
 
-It removes the bar entry from `shell.json` and the Hyprland block (both after backups), the widget,
+Use this rather than `omarchy plugin remove` alone, which only deletes the plugin folder and leaves the
+Hyprland block behind (the hotkeys then do nothing, since `dictarchy.lua` skips its binds when the command is gone).
+
+It removes the bar entry from `shell.json` and the Hyprland block (both after backups), unloads and deletes the plugin folder,
 `~/.config/hypr/dictarchy.lua`, `~/.local/bin/dictarchy` and the runtime directory. It asks before deleting
 the config directory (it contains your API key) and the state directory (log and language).
 
@@ -215,8 +245,9 @@ bash tests/smoke.sh   # stub-based; needs no audio device, network, Wayland or r
 
 The test replaces every external tool with a stub and covers configuration parsing, recording, push-to-talk,
 the setup state and key handling, language cycling, status JSON, API errors, the generated Lua bindings
-(checked with `luac` and a Lua harness), the settings menu, the widget's QML syntax and status parser, and an
-install/uninstall round trip in a sandbox `HOME` that must leave `hyprland.lua` and `shell.json` exactly as they were.
+(checked with `luac` and a Lua harness), the settings menu, the widget's QML syntax and status parser, an
+install/uninstall round trip in a sandbox `HOME` that must leave `hyprland.lua` and `shell.json` exactly as they were,
+and the `omarchy plugin add` flow (the repository root as the plugin folder, setup from there).
 
 ## License
 
