@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
-# dictarchy - speech-to-text via a cloud API, driven by hotkeys (Omarchy / Hyprland).
-# Run "dictarchy help" for the command overview.
+# dictarchy - speech-to-text via a cloud API for Omarchy 4.5+ (Hyprland Lua
+# config, Omarchy shell bar, Omarchy menu). Run "dictarchy help" for an overview.
 set -euo pipefail
 
-readonly VERSION="0.1.0"
+readonly VERSION="0.2.0"
 readonly SELF="$(readlink -f -- "${BASH_SOURCE[0]}")"
 
 # ---------------------------------------------------------------------------
@@ -17,7 +17,8 @@ readonly CONFIG_DIR="$CONFIG_HOME/dictarchy"
 readonly CONFIG_FILE="$CONFIG_DIR/config"
 readonly API_KEY_FILE="$CONFIG_DIR/api_key"
 readonly HYPR_DIR="$CONFIG_HOME/hypr"
-readonly BINDINGS_FILE="$HYPR_DIR/dictarchy.conf"
+readonly BINDINGS_FILE="$HYPR_DIR/dictarchy.lua"
+readonly OMARCHY_LANGUAGE_FILE="$CONFIG_HOME/omarchy/language"
 
 readonly STATE_DIR="$STATE_HOME/dictarchy"
 readonly LANG_FILE="$STATE_DIR/language"
@@ -26,18 +27,14 @@ readonly LOG_FILE="$STATE_DIR/dictarchy.log"
 readonly RUN_DIR="$RUNTIME_BASE/dictarchy"
 readonly LOCK_FILE="$RUN_DIR/lock"
 readonly STATE_FILE="$RUN_DIR/state"
+readonly STATUS_FILE="$RUN_DIR/status.json"   # watched by the bar widget
 readonly PID_FILE="$RUN_DIR/pid"
 readonly START_FILE="$RUN_DIR/started_ms"
 readonly SESSION_FILE="$RUN_DIR/session"
 readonly SHOWN_FILE="$RUN_DIR/shown"
-readonly MODE_FILE="$RUN_DIR/mode"            # "ptt" or "toggle"
+readonly MODE_FILE="$RUN_DIR/mode"              # "ptt" or "toggle"
 readonly RELEASED_FILE="$RUN_DIR/ptt_released"  # release seen before its press
 readonly WAV_FILE="$RUN_DIR/recording.wav"
-
-# Nerd Font icons, written as UTF-8 bytes so they do not depend on the locale.
-readonly ICON_MIC=$(printf '\xf3\xb0\x8d\xac')        # md-microphone
-readonly ICON_MIC_ERROR=$(printf '\xf3\xb0\x8d\xad')  # md-microphone_off
-readonly ICON_BUSY=$(printf '\xf3\xb0\x94\x9f')       # md-timer_sand
 
 readonly ERROR_HOLD_SECONDS=3       # how long an error stays visible
 readonly ERROR_TIMEOUT=10           # stale "error" state is ignored after this
@@ -45,15 +42,16 @@ readonly TRANSCRIBING_TIMEOUT=120   # stale "transcribing" state is ignored afte
 readonly LONG_RECORDING_MS=3000     # silent recordings this long are reported
 readonly STOP_WAIT_TENTHS=20        # wait up to 2 s for pw-record to exit
 readonly EARLY_RELEASE_MS=1000      # a push-to-talk release this recent cancels its press
+readonly TEST_RECORD_SECONDS=4      # length of the sample recorded by "dictarchy test"
 
 # ---------------------------------------------------------------------------
-# Configuration defaults (overridden by $CONFIG_FILE, never sourced)
+# Configuration defaults (overridden by $CONFIG_FILE, which is parsed, never sourced)
 # ---------------------------------------------------------------------------
 readonly -a CONFIG_KEYS=(
   API_BASE_URL MODEL LANGUAGE LANGUAGES PROMPT OUTPUT_MODE TRAILING_SPACE
-  MIN_DURATION_MS SILENCE_THRESHOLD_DB PTT_KEY PTT_MODS TOGGLE_KEY TOGGLE_MODS
-  WAYBAR_SIGNAL NOTIFY
+  MIN_DURATION_MS SILENCE_THRESHOLD_DB PTT_KEY PTT_MODS TOGGLE_KEY TOGGLE_MODS NOTIFY
 )
+readonly -a DEPRECATED_KEYS=(WAYBAR_SIGNAL)   # accepted silently from 0.1 configs
 API_BASE_URL="https://api.groq.com/openai/v1"
 MODEL="whisper-large-v3-turbo"
 LANGUAGE="en"
@@ -67,11 +65,249 @@ PTT_KEY="Control_L"
 PTT_MODS=""
 TOGGLE_KEY="D"
 TOGGLE_MODS="SUPER ALT"
-WAYBAR_SIGNAL=11
 NOTIFY="true"
 
-API_KEY=""     # filled by resolve_api_key, never printed or logged
-PTT_MODE=0     # set by parse_ptt_flag
+API_KEY=""        # filled by resolve_api_key, never printed or logged
+PTT_MODE=0        # set by parse_ptt_flag
+UI_LANG="en"      # language of menus, prompts and notifications (follows Omarchy)
+TRANSCRIPT=""     # set by transcribe
+HTTP_CODE=""      # set by transcribe / verify_key
+API_MESSAGE=""    # set by transcribe
+
+# ---------------------------------------------------------------------------
+# User-facing text (English and German; follows "omarchy language")
+# Log lines and CLI errors stay in English.
+# ---------------------------------------------------------------------------
+declare -A MSG_EN=(
+  [recording]="Recording..."
+  [still_transcribing]="Still transcribing - please wait"
+  [no_pwrecord]="pw-record not found - install pipewire"
+  [no_audio]="No audio was recorded - check the microphone"
+  [no_speech]="No speech detected"
+  [nothing_recognized]="Nothing recognized"
+  [cancelled]="Recording cancelled"
+  [setup_needed]="Setup needed - click the dictarchy icon in the bar"
+  [err_no_key]="No API key - click the dictarchy icon in the bar"
+  [err_network]="Network error - API not reachable"
+  [err_invalid_key]="Invalid API key - right-click the dictarchy icon to change it"
+  [err_too_large]="Audio file too large"
+  [err_rate_limited]="Rate limited - try again later"
+  [err_api]="API error %s"
+  [err_no_output]="No output tool found - install wtype and wl-clipboard"
+  [err_no_terminal]="xdg-terminal-exec not found - cannot open a terminal"
+  [err_no_menu]="omarchy-menu-select not found - this needs Omarchy 4.5 or newer"
+  [clipboard_failed]="Clipboard copy failed"
+  [typing_failed]="Typing failed - is a Wayland session running?"
+  [wtype_missing]="wtype not found - copying to clipboard instead"
+  [wlcopy_missing]="wl-copy not found - clipboard skipped"
+  [language_set]="Language: %s"
+  [ptt_set]="Push-to-talk: %s"
+  [toggle_set]="Toggle: %s"
+  [output_set]="Output: %s"
+  [key_saved]="API key saved"
+  [hypr_errors]="Hyprland reports config errors - see the dictarchy log"
+  [disabled]="disabled"
+
+  [menu_title]="dictarchy"
+  [menu_api_key]="API key"
+  [menu_key_set]="saved"
+  [menu_key_missing]="missing - setup needed"
+  [menu_key_env]="from environment variable"
+  [menu_language]="Language"
+  [menu_ptt]="Push-to-talk key"
+  [menu_toggle]="Toggle key"
+  [menu_output]="Output"
+  [menu_test]="Test"
+  [menu_test_sub]="Check the setup and transcribe a short sample"
+  [menu_log]="Log"
+  [menu_other]="Other..."
+  [menu_disable]="Disable"
+  [menu_current]="current"
+  [menu_default]="default"
+  [lang_auto]="Detect automatically"
+  [output_both]="Type and copy to clipboard"
+  [output_type]="Type only"
+  [output_clipboard]="Clipboard only"
+  [key_Control_L]="Left Ctrl - hold"
+  [key_Control_R]="Right Ctrl - hold"
+  [key_Alt_R]="Right Alt - hold"
+  [key_Super_R]="Right Super - hold"
+  [key_F9]="F9 - hold"
+  [key_toggle_default]="Press once to start, again to stop"
+  [input_language]="Language code, e.g. fr"
+  [input_ptt]="Key, e.g. Control_R or SUPER + F9"
+  [input_toggle]="Key combination, e.g. SUPER + ALT + D"
+  [invalid_combo]="Invalid key: %s"
+  [invalid_language]="Invalid language code: %s"
+  [conflict]="%s is already bound: %s"
+  [conflict_use]="Use anyway"
+  [conflict_cancel]="Cancel"
+
+  [kp_title]="dictarchy - API key"
+  [kp_where]="Create a key at %s"
+  [kp_input]="API key (input hidden, empty to cancel): "
+  [kp_checking]="Checking the key..."
+  [kp_ok]="Key accepted and saved to %s."
+  [kp_rejected]="The API rejected this key (HTTP %s). It was not saved."
+  [kp_unreachable]="Could not verify the key (no connection or HTTP %s)."
+  [kp_save_anyway]="Save it anyway? [y/N] "
+  [kp_saved_unverified]="Key saved without verification."
+  [kp_cancelled]="Cancelled - nothing changed."
+  [kp_invalid]="That does not look like an API key (8-512 characters, no spaces)."
+  [kp_retry]="Try again."
+  [press_enter]="Press Enter to close."
+
+  [t_title]="dictarchy test"
+  [t_tools]="Tools"
+  [t_optional]="optional"
+  [t_missing]="missing"
+  [t_key]="API key"
+  [t_key_none]="no API key - right-click the bar icon and choose API key"
+  [t_api]="API connection"
+  [t_api_ok]="%s accepted the key"
+  [t_api_bad]="%s rejected the key (HTTP %s)"
+  [t_api_down]="%s not reachable (HTTP %s)"
+  [t_hypr]="Hyprland bindings"
+  [t_hypr_ok]="%s active"
+  [t_hypr_missing]="not loaded - run install.sh again"
+  [t_bar]="Bar widget"
+  [t_bar_ok]="in the bar"
+  [t_bar_missing]="not in the bar - run install.sh again"
+  [t_busy]="A recording is in progress - stop it first."
+  [t_record_prompt]="Press Enter to record a %s-second sample (Ctrl+C to skip)."
+  [t_recording]="Recording... speak now."
+  [t_peak]="Peak level: %s dB"
+  [t_silent]="Only silence was recorded - check the microphone in the audio settings."
+  [t_result]="Transcript:"
+  [t_failed]="Transcription failed: %s"
+)
+
+declare -A MSG_DE=(
+  [recording]="Aufnahme läuft …"
+  [still_transcribing]="Transkription läuft noch – bitte warten"
+  [no_pwrecord]="pw-record nicht gefunden – pipewire installieren"
+  [no_audio]="Keine Audiodaten aufgenommen – Mikrofon prüfen"
+  [no_speech]="Keine Sprache erkannt"
+  [nothing_recognized]="Nichts erkannt"
+  [cancelled]="Aufnahme abgebrochen"
+  [setup_needed]="Einrichtung nötig – auf das dictarchy-Symbol in der Leiste klicken"
+  [err_no_key]="Kein API-Key – auf das dictarchy-Symbol in der Leiste klicken"
+  [err_network]="Netzwerkfehler – API nicht erreichbar"
+  [err_invalid_key]="Ungültiger API-Key – Rechtsklick auf das dictarchy-Symbol, um ihn zu ändern"
+  [err_too_large]="Audiodatei zu groß"
+  [err_rate_limited]="Anfragelimit erreicht – später erneut versuchen"
+  [err_api]="API-Fehler %s"
+  [err_no_output]="Kein Ausgabewerkzeug – wtype und wl-clipboard installieren"
+  [err_no_terminal]="xdg-terminal-exec nicht gefunden – kein Terminal verfügbar"
+  [err_no_menu]="omarchy-menu-select nicht gefunden – benötigt Omarchy 4.5 oder neuer"
+  [clipboard_failed]="Kopieren in die Zwischenablage fehlgeschlagen"
+  [typing_failed]="Eintippen fehlgeschlagen – läuft eine Wayland-Sitzung?"
+  [wtype_missing]="wtype nicht gefunden – Text kommt in die Zwischenablage"
+  [wlcopy_missing]="wl-copy nicht gefunden – Zwischenablage übersprungen"
+  [language_set]="Sprache: %s"
+  [ptt_set]="Push-to-Talk: %s"
+  [toggle_set]="Toggle: %s"
+  [output_set]="Ausgabe: %s"
+  [key_saved]="API-Key gespeichert"
+  [hypr_errors]="Hyprland meldet Konfigurationsfehler – siehe dictarchy-Log"
+  [disabled]="deaktiviert"
+
+  [menu_title]="dictarchy"
+  [menu_api_key]="API-Key"
+  [menu_key_set]="hinterlegt"
+  [menu_key_missing]="fehlt – Einrichtung nötig"
+  [menu_key_env]="aus Umgebungsvariable"
+  [menu_language]="Sprache"
+  [menu_ptt]="Push-to-Talk-Taste"
+  [menu_toggle]="Toggle-Taste"
+  [menu_output]="Ausgabe"
+  [menu_test]="Test"
+  [menu_test_sub]="Einrichtung prüfen und eine kurze Probe transkribieren"
+  [menu_log]="Log"
+  [menu_other]="Andere …"
+  [menu_disable]="Deaktivieren"
+  [menu_current]="aktuell"
+  [menu_default]="Standard"
+  [lang_auto]="Automatisch erkennen"
+  [output_both]="Eintippen und in die Zwischenablage"
+  [output_type]="Nur eintippen"
+  [output_clipboard]="Nur Zwischenablage"
+  [key_Control_L]="Strg links – halten"
+  [key_Control_R]="Strg rechts – halten"
+  [key_Alt_R]="Alt rechts – halten"
+  [key_Super_R]="Super rechts – halten"
+  [key_F9]="F9 – halten"
+  [key_toggle_default]="Einmal drücken startet, nochmal drücken stoppt"
+  [input_language]="Sprachcode, z. B. fr"
+  [input_ptt]="Taste, z. B. Control_R oder SUPER + F9"
+  [input_toggle]="Tastenkombination, z. B. SUPER + ALT + D"
+  [invalid_combo]="Ungültige Taste: %s"
+  [invalid_language]="Ungültiger Sprachcode: %s"
+  [conflict]="%s ist schon belegt: %s"
+  [conflict_use]="Trotzdem verwenden"
+  [conflict_cancel]="Abbrechen"
+
+  [kp_title]="dictarchy – API-Key"
+  [kp_where]="Einen Key erstellst du unter %s"
+  [kp_input]="API-Key (Eingabe versteckt, leer = abbrechen): "
+  [kp_checking]="Key wird geprüft …"
+  [kp_ok]="Key akzeptiert und in %s gespeichert."
+  [kp_rejected]="Die API hat den Key abgelehnt (HTTP %s). Er wurde nicht gespeichert."
+  [kp_unreachable]="Der Key konnte nicht geprüft werden (keine Verbindung oder HTTP %s)."
+  [kp_save_anyway]="Trotzdem speichern? [j/N] "
+  [kp_saved_unverified]="Key ungeprüft gespeichert."
+  [kp_cancelled]="Abgebrochen – nichts geändert."
+  [kp_invalid]="Das sieht nicht nach einem API-Key aus (8–512 Zeichen, keine Leerzeichen)."
+  [kp_retry]="Bitte nochmal."
+  [press_enter]="Enter zum Schließen."
+
+  [t_title]="dictarchy-Test"
+  [t_tools]="Werkzeuge"
+  [t_optional]="optional"
+  [t_missing]="fehlt"
+  [t_key]="API-Key"
+  [t_key_none]="kein API-Key – Rechtsklick auf das Leisten-Symbol, dann API-Key"
+  [t_api]="API-Verbindung"
+  [t_api_ok]="%s hat den Key akzeptiert"
+  [t_api_bad]="%s hat den Key abgelehnt (HTTP %s)"
+  [t_api_down]="%s nicht erreichbar (HTTP %s)"
+  [t_hypr]="Hyprland-Tasten"
+  [t_hypr_ok]="%s aktiv"
+  [t_hypr_missing]="nicht geladen – install.sh erneut ausführen"
+  [t_bar]="Leisten-Widget"
+  [t_bar_ok]="in der Leiste"
+  [t_bar_missing]="nicht in der Leiste – install.sh erneut ausführen"
+  [t_busy]="Es läuft gerade eine Aufnahme – erst beenden."
+  [t_record_prompt]="Enter drücken für eine %s-Sekunden-Probe (Strg+C überspringt)."
+  [t_recording]="Aufnahme … jetzt sprechen."
+  [t_peak]="Spitzenpegel: %s dB"
+  [t_silent]="Nur Stille aufgenommen – Mikrofon in den Audio-Einstellungen prüfen."
+  [t_result]="Transkript:"
+  [t_failed]="Transkription fehlgeschlagen: %s"
+)
+
+detect_ui_lang() {
+  local code=${DICTARCHY_UI_LANG:-}
+  if [[ -z $code && -r $OMARCHY_LANGUAGE_FILE ]]; then
+    IFS= read -r code < "$OMARCHY_LANGUAGE_FILE" || true
+  fi
+  case ${code//[[:space:]]/} in
+    de|de-*) UI_LANG=de ;;
+    *) UI_LANG=en ;;
+  esac
+}
+
+t() {  # KEY [ARGS...] - prints the localized text, %s filled from ARGS
+  local key=$1 fmt
+  shift
+  if [[ $UI_LANG == de && -n ${MSG_DE[$key]+set} ]]; then
+    fmt=${MSG_DE[$key]}
+  else
+    fmt=${MSG_EN[$key]:-$key}
+  fi
+  # shellcheck disable=SC2059 # the format strings come from the tables above
+  printf -- "$fmt" "$@"
+}
 
 # ---------------------------------------------------------------------------
 # Small helpers
@@ -146,10 +382,6 @@ notify_user() {  # [-f] MESSAGE - -f shows the message even when NOTIFY=false
     "dictarchy" "$*" >/dev/null 2>&1 || true
 }
 
-refresh_waybar() {
-  pkill -RTMIN+"$WAYBAR_SIGNAL" waybar >/dev/null 2>&1 || true
-}
-
 json_escape() {
   local s=$1
   s=${s//\\/\\\\}
@@ -159,9 +391,16 @@ json_escape() {
   printf '%s' "$s"
 }
 
-hotkey_label() {  # MODS KEY
+shell_quote() {  # prints the argument quoted for bash
+  printf '%q' "$1"
+}
+
+# ---------------------------------------------------------------------------
+# Hotkeys: "MODS" + "KEY" <-> "SUPER + ALT + D"
+# ---------------------------------------------------------------------------
+combo_label() {  # MODS KEY -> "SUPER + ALT + D", "D", or "" when KEY is empty
   if [[ -z $2 ]]; then
-    printf 'disabled'
+    printf ''
   elif [[ -z $1 ]]; then
     printf '%s' "$2"
   else
@@ -169,37 +408,79 @@ hotkey_label() {  # MODS KEY
   fi
 }
 
-modifier_for_key() {  # modifier keys report their modifier in the release mask
+is_modifier_key() {
   case $1 in
-    Control_L|Control_R) printf 'CTRL' ;;
-    Shift_L|Shift_R) printf 'SHIFT' ;;
-    Alt_L|Alt_R) printf 'ALT' ;;
-    Super_L|Super_R) printf 'SUPER' ;;
-    *) printf '' ;;
+    Control_L|Control_R|Shift_L|Shift_R|Alt_L|Alt_R|Super_L|Super_R|Meta_L|Meta_R|ISO_Level3_Shift) return 0 ;;
+    *) return 1 ;;
   esac
 }
 
-merge_mods() {  # "MODS1" "MODS2" -> space-separated, de-duplicated
-  local -a words=() out=()
-  local w s seen
-  read -r -a words <<< "$1 $2"
-  for w in "${words[@]}"; do
-    seen=0
-    for s in "${out[@]}"; do
-      [[ $s == "$w" ]] && seen=1
-    done
-    if (( ! seen )); then out+=("$w"); fi
+normalize_mod() {  # prints the Hyprland modifier name, or fails
+  case ${1^^} in
+    SUPER|WIN|LOGO|META|MOD4) printf 'SUPER' ;;
+    CTRL|CONTROL) printf 'CTRL' ;;
+    ALT|MOD1) printf 'ALT' ;;
+    SHIFT) printf 'SHIFT' ;;
+    *) return 1 ;;
+  esac
+}
+
+# Parses "SUPER + F9", "super+f9" or "Control_R" into COMBO_MODS / COMBO_KEY.
+parse_combo() {  # TEXT -> 0 on success
+  local text parts=() part mod key mods=()
+  text=$(trim "$1")
+  [[ -n $text ]] || return 1
+  IFS='+' read -r -a parts <<< "$text"
+  (( ${#parts[@]} > 0 )) || return 1
+  key=$(trim "${parts[-1]}")
+  [[ $key =~ ^[A-Za-z0-9_]+$ ]] || return 1
+  if [[ $key =~ ^[a-z]$ ]]; then key=${key^^}; fi
+  for part in "${parts[@]:0:${#parts[@]}-1}"; do
+    part=$(trim "$part")
+    mod=$(normalize_mod "$part") || return 1
+    if [[ " ${mods[*]} " != *" $mod "* ]]; then mods+=("$mod"); fi
   done
-  printf '%s' "${out[*]}"
+  COMBO_MODS="${mods[*]}"
+  COMBO_KEY=$key
+}
+
+modmask_of() {  # MODS -> Hyprland modmask number
+  local mask=0 mod
+  for mod in $1; do
+    case $mod in
+      SHIFT) mask=$((mask | 1)) ;;
+      CTRL) mask=$((mask | 4)) ;;
+      ALT) mask=$((mask | 8)) ;;
+      SUPER) mask=$((mask | 64)) ;;
+    esac
+  done
+  printf '%s' "$mask"
+}
+
+# Prints the description of a non-dictarchy Hyprland bind on MODS+KEY, if any.
+# With ANY_MODS=1 every bind on KEY counts (for modifier keys, which ignore mods).
+bind_conflict() {  # MODS KEY ANY_MODS
+  have hyprctl && have jq || return 0
+  local binds mask
+  binds=$(hyprctl binds -j 2>/dev/null) || return 0
+  mask=$(modmask_of "$1")
+  jq -r --arg key "$2" --argjson mask "$mask" --argjson any "${3:-0}" '
+    [ .[]
+      | select((.key | ascii_downcase) == ($key | ascii_downcase))
+      | select($any == 1 or .modmask == $mask)
+      | select((.description // "") | startswith("Dictarchy") | not)
+      | (if (.description // "") != "" then .description else "\(.dispatcher) \(.arg)" end)
+    ] | unique | join(", ")' <<< "$binds" 2>/dev/null || true
 }
 
 # ---------------------------------------------------------------------------
 # Configuration
 # ---------------------------------------------------------------------------
-is_known_key() {
-  local k
-  for k in "${CONFIG_KEYS[@]}"; do
-    if [[ $k == "$1" ]]; then return 0; fi
+in_list() {  # WORD LIST...
+  local w=$1 k
+  shift
+  for k in "$@"; do
+    if [[ $k == "$w" ]]; then return 0; fi
   done
   return 1
 }
@@ -233,11 +514,10 @@ validate_config() {
   check_value NOTIFY '^(true|false)$' "true"
   check_value MIN_DURATION_MS '^[0-9]+$' "400"
   check_value SILENCE_THRESHOLD_DB '^-?[0-9]+([.][0-9]+)?$' "-50"
-  check_value WAYBAR_SIGNAL '^[0-9]+$' "11"
   check_value PTT_KEY '^[A-Za-z0-9_]*$' "Control_L"
-  check_value PTT_MODS '^[A-Za-z_ ]*$' ""
+  check_value PTT_MODS '^[A-Z ]*$' ""
   check_value TOGGLE_KEY '^[A-Za-z0-9_]*$' "D"
-  check_value TOGGLE_MODS '^[A-Za-z_ ]*$' "SUPER ALT"
+  check_value TOGGLE_MODS '^[A-Z ]*$' "SUPER ALT"
   return 0
 }
 
@@ -256,7 +536,10 @@ load_config() {
       fi
       key=${BASH_REMATCH[1]}
       value=$(unquote "${BASH_REMATCH[2]}")
-      if ! is_known_key "$key"; then
+      if in_list "$key" "${DEPRECATED_KEYS[@]}"; then
+        continue
+      fi
+      if ! in_list "$key" "${CONFIG_KEYS[@]}"; then
         warn "config line $lineno: unknown key '$key' ignored"
         continue
       fi
@@ -266,9 +549,10 @@ load_config() {
   validate_config
 }
 
-write_default_config() {
+ensure_config() {
   local k
   mkdir -p -m 700 "$CONFIG_DIR"
+  [[ -f $CONFIG_FILE ]] && return 0
   {
     echo "# dictarchy configuration - KEY=value per line, see README.md"
     for k in "${CONFIG_KEYS[@]}"; do
@@ -277,12 +561,13 @@ write_default_config() {
   } > "$CONFIG_FILE"
 }
 
-config_set() {  # KEY VALUE - replaces the line or appends it
+config_set() {  # KEY VALUE - replaces the line or appends it, and updates the variable
   local key=$1 value=$2 tmp line found=0
+  ensure_config
   tmp=$(mktemp "$CONFIG_DIR/config.XXXXXX")
   while IFS= read -r line || [[ -n $line ]]; do
     if [[ $line == "$key="* ]]; then
-      printf '%s="%s"\n' "$key" "$value"
+      if (( ! found )); then printf '%s="%s"\n' "$key" "$value"; fi
       found=1
     else
       printf '%s\n' "$line"
@@ -292,6 +577,8 @@ config_set() {  # KEY VALUE - replaces the line or appends it
     printf '%s="%s"\n' "$key" "$value" >> "$tmp"
   fi
   mv -f -- "$tmp" "$CONFIG_FILE"
+  printf -v "$key" '%s' "$value"
+  log_line "config: $key changed"
 }
 
 current_language() {
@@ -307,20 +594,27 @@ current_language() {
 # ---------------------------------------------------------------------------
 # API key (never in argv, logs or notifications)
 # ---------------------------------------------------------------------------
-resolve_api_key() {
-  local mode
+API_KEY_SOURCE=""   # env, file or empty
+
+resolve_api_key() {  # [-q] - -q: no permission warning (status polling)
+  local mode quiet=0
+  if [[ ${1:-} == -q ]]; then quiet=1; fi
   API_KEY=""
+  API_KEY_SOURCE=""
   if [[ -n ${DICTARCHY_API_KEY:-} ]]; then
     API_KEY=$DICTARCHY_API_KEY
+    API_KEY_SOURCE=env
   elif [[ -n ${GROQ_API_KEY:-} ]]; then
     API_KEY=$GROQ_API_KEY
+    API_KEY_SOURCE=env
   elif [[ -f $API_KEY_FILE ]]; then
     mode=$(stat -c '%a' "$API_KEY_FILE" 2>/dev/null || echo 600)
-    if (( 8#$mode & 077 )); then
+    if (( ! quiet && (8#$mode & 077) )); then
       warn "permissions of $API_KEY_FILE are $mode, expected 600 (chmod 600 $API_KEY_FILE)"
     fi
     API_KEY=$(<"$API_KEY_FILE")
     API_KEY=$(trim "${API_KEY//$'\n'/}")
+    if [[ -n $API_KEY ]]; then API_KEY_SOURCE=file; fi
   fi
 }
 
@@ -330,10 +624,45 @@ save_api_key() {  # KEY - written with umask 077, then chmod 600
   ( umask 077; printf '%s\n' "$1" > "$tmp" )
   chmod 600 "$tmp"
   mv -f -- "$tmp" "$API_KEY_FILE"
+  log_line "api key saved"
+}
+
+valid_key_format() {
+  [[ $1 =~ ^[[:graph:]]{8,512}$ ]]
+}
+
+key_console_url() {
+  case $API_BASE_URL in
+    *api.groq.com*) printf 'https://console.groq.com/keys' ;;
+    *api.openai.com*) printf 'https://platform.openai.com/api-keys' ;;
+    *) printf '' ;;
+  esac
+}
+
+api_host() {
+  local h=${API_BASE_URL#*://}
+  printf '%s' "${h%%/*}"
+}
+
+# curl with the key passed as a config on stdin, never in argv. Extra args follow.
+curl_with_key() {  # KEY CURL_ARGS...
+  local esc=$1
+  shift
+  esc=${esc//\\/\\\\}
+  esc=${esc//\"/\\\"}
+  printf 'header = "Authorization: Bearer %s"\n' "$esc" | curl -K - "$@"
+}
+
+verify_key() {  # KEY -> sets HTTP_CODE ("000" when unreachable); 0 when accepted
+  ensure_dirs  # the log file below must be writable, or the redirect fails like a network error
+  HTTP_CODE=$(curl_with_key "$1" -sS --max-time 15 -o /dev/null -w '%{http_code}' \
+    "$API_BASE_URL/models" 2>>"$LOG_FILE") || HTTP_CODE="000"
+  log_line "key check http=$HTTP_CODE"
+  [[ $HTTP_CODE == 200 ]]
 }
 
 # ---------------------------------------------------------------------------
-# Recording state
+# Status for the bar widget
 # ---------------------------------------------------------------------------
 set_state() {  # caller holds the lock
   printf '%s\n' "$1" > "$STATE_FILE"
@@ -357,6 +686,39 @@ effective_state() {
   esac
 }
 
+status_json() {
+  local st
+  st=$(effective_state)
+  if [[ $st == recording && ! -e $SHOWN_FILE ]]; then
+    st=idle  # push-to-talk: stay quiet until the press lasts MIN_DURATION_MS
+  fi
+  if [[ $st == idle ]]; then
+    resolve_api_key -q
+    if [[ -z $API_KEY ]]; then st=setup; fi
+    API_KEY=""
+  fi
+  printf '{"state":"%s","language":"%s","ptt":"%s","toggle":"%s","output":"%s"}\n' \
+    "$st" "$(json_escape "$(current_language)")" \
+    "$(json_escape "$(combo_label "$PTT_MODS" "$PTT_KEY")")" \
+    "$(json_escape "$(combo_label "$TOGGLE_MODS" "$TOGGLE_KEY")")" \
+    "$OUTPUT_MODE"
+}
+
+# Writes the status file the bar widget watches. Safe to call with or without the lock.
+refresh_bar() {
+  local tmp
+  mkdir -p "$RUN_DIR" 2>/dev/null || return 0
+  tmp=$(mktemp "$RUN_DIR/status.XXXXXX" 2>/dev/null) || return 0
+  if status_json > "$tmp" 2>/dev/null; then
+    mv -f -- "$tmp" "$STATUS_FILE"
+  else
+    rm -f -- "$tmp"
+  fi
+}
+
+# ---------------------------------------------------------------------------
+# Recording
+# ---------------------------------------------------------------------------
 cleanup_session() {  # caller holds the lock
   rm -f -- "$PID_FILE" "$START_FILE" "$SESSION_FILE" "$SHOWN_FILE" "$MODE_FILE"
 }
@@ -368,7 +730,21 @@ discard_recording() {  # caller holds the lock
 }
 
 cleanup_tmp() {  # EXIT trap: temporary audio and response of this process only
-  rm -f -- "$RUN_DIR/job-$$."* "$RUN_DIR/resp-$$.txt" 2>/dev/null || true
+  rm -f -- "$RUN_DIR/job-$$."* "$RUN_DIR/resp-$$.txt" "$RUN_DIR/test-$$."* 2>/dev/null || true
+}
+
+# Starts pw-record on FILE in the background and prints its PID.
+start_recorder() {  # FILE
+  # Background jobs of a non-interactive shell start with SIGINT ignored, and that
+  # disposition is inherited by pw-record, so it would ignore our stop signal.
+  # env --default-signal resets it before exec (coreutils >= 8.31).
+  local -a launcher=(setsid)
+  if env --default-signal=INT true 2>/dev/null; then
+    launcher=(env --default-signal=INT,QUIT,TERM setsid)
+  fi
+  "${launcher[@]}" pw-record --rate 16000 --channels 1 --format s16 "$1" \
+    </dev/null >> "$LOG_FILE" 2>&1 9>&- &
+  printf '%s' "$!"
 }
 
 # Ask a running pw-record to finish: SIGINT (finalizes the WAV), then SIGTERM.
@@ -385,10 +761,7 @@ stop_recorder() {  # PID
   sleep 0.3
 }
 
-# ---------------------------------------------------------------------------
-# Start / stop / reveal. Both do_* functions expect the lock to be held and
-# always release it before returning.
-# ---------------------------------------------------------------------------
+# Both do_* functions expect the lock to be held and release it before returning.
 do_start_locked() {  # PTT_FLAG
   local ptt=$1 sid pid secs
   case $(effective_state) in
@@ -397,13 +770,23 @@ do_start_locked() {  # PTT_FLAG
       return 0 ;;
     transcribing)
       release_lock
-      if (( ! ptt )); then notify_user "Still transcribing - please wait"; fi
+      if (( ! ptt )); then notify_user "$(t still_transcribing)"; fi
       return 0 ;;
   esac
 
+  resolve_api_key -q
+  if [[ -z $API_KEY ]]; then
+    release_lock
+    log_line "start: no API key, not recording (ptt=$ptt)"
+    if (( ! ptt )); then notify_user -f "$(t setup_needed)"; fi
+    refresh_bar
+    return 0
+  fi
+  API_KEY=""
+
   if ! have pw-record; then
     release_lock
-    notify_user -f "pw-record not found - install pipewire"
+    notify_user -f "$(t no_pwrecord)"
     return 1
   fi
 
@@ -422,16 +805,7 @@ do_start_locked() {  # PTT_FLAG
   fi
   rm -f -- "$WAV_FILE" "$SHOWN_FILE" "$RELEASED_FILE"
   sid="$(now_ms)-$$"
-  # Background jobs of a non-interactive shell start with SIGINT ignored, and that
-  # disposition is inherited by pw-record, so it would ignore our stop signal.
-  # env --default-signal resets it before exec (coreutils >= 8.31).
-  local -a launcher=(setsid)
-  if env --default-signal=INT true 2>/dev/null; then
-    launcher=(env --default-signal=INT,QUIT,TERM setsid)
-  fi
-  "${launcher[@]}" pw-record --rate 16000 --channels 1 --format s16 "$WAV_FILE" \
-    </dev/null >> "$LOG_FILE" 2>&1 9>&- &
-  pid=$!
+  pid=$(start_recorder "$WAV_FILE")
   printf '%s\n' "$pid" > "$PID_FILE"
   printf '%s\n' "$sid" > "$SESSION_FILE"
   now_ms > "$START_FILE"
@@ -452,8 +826,8 @@ do_start_locked() {  # PTT_FLAG
       ( sleep "$secs"; "$SELF" _reveal "$sid" ) </dev/null >/dev/null 2>&1 9>&- &
     fi
   else
-    notify_user "Recording..."
-    refresh_waybar
+    notify_user "$(t recording)"
+    refresh_bar
   fi
 }
 
@@ -461,20 +835,39 @@ reveal_session() {  # SESSION_ID - used by the push-to-talk delay
   acquire_lock
   if [[ $(effective_state) == recording && $(read_file "$SESSION_FILE") == "$1" && ! -e $SHOWN_FILE ]]; then
     touch "$SHOWN_FILE"
-    notify_user "Recording..."
-    refresh_waybar
+    notify_user "$(t recording)"
+    refresh_bar
   fi
   release_lock
 }
 
+peak_db() {  # WAV - prints the peak level in dBFS ("-inf" for digital silence), or nothing
+  have ffmpeg || return 0
+  ffmpeg -hide_banner -nostats -i "$1" -af volumedetect -f null - 2>&1 \
+    | sed -n 's/.*max_volume: \([^ ]*\) dB.*/\1/p' | head -n 1 || true
+}
+
 is_silent() {  # WAV - true when the peak level is below SILENCE_THRESHOLD_DB
-  have ffmpeg || return 1
   local peak
-  peak=$(ffmpeg -hide_banner -nostats -i "$1" -af volumedetect -f null - 2>&1 \
-    | sed -n 's/.*max_volume: \([^ ]*\) dB.*/\1/p' | head -n 1 || true)
+  peak=$(peak_db "$1")
   if [[ -z $peak ]]; then return 1; fi
   if [[ $peak == -inf ]]; then return 0; fi
   awk -v p="$peak" -v t="$SILENCE_THRESHOLD_DB" 'BEGIN { exit !(p + 0 < t + 0) }'
+}
+
+compress_audio() {  # WAV BASE - prints the file to upload (FLAC when ffmpeg works)
+  local wav=$1 flac="$2.flac"
+  if have ffmpeg; then
+    if ffmpeg -hide_banner -loglevel error -y -i "$wav" -c:a flac "$flac" 2>>"$LOG_FILE" \
+       && [[ -s $flac ]]; then
+      rm -f -- "$wav"
+      printf '%s' "$flac"
+      return 0
+    fi
+    log_line "FLAC compression failed, sending WAV"
+    rm -f -- "$flac"
+  fi
+  printf '%s' "$wav"
 }
 
 do_stop_locked() {  # PTT_FLAG
@@ -503,8 +896,8 @@ do_stop_locked() {  # PTT_FLAG
     log_line "stop: no audio file was produced"
     discard_recording
     release_lock
-    refresh_waybar
-    if (( ! ptt )); then notify_user -f "No audio was recorded - check pw-record"; fi
+    refresh_bar
+    if (( ! ptt )); then notify_user -f "$(t no_audio)"; fi
     return 1
   fi
 
@@ -512,7 +905,7 @@ do_stop_locked() {  # PTT_FLAG
     log_line "stop: discarded short recording (${dur_ms} ms)"
     discard_recording
     release_lock
-    refresh_waybar
+    refresh_bar
     return 0
   fi
 
@@ -520,29 +913,20 @@ do_stop_locked() {  # PTT_FLAG
     log_line "stop: discarded silent recording (${dur_ms} ms)"
     discard_recording
     release_lock
-    refresh_waybar
-    if (( ! ptt || dur_ms >= LONG_RECORDING_MS )); then notify_user "No speech detected"; fi
+    refresh_bar
+    if (( ! ptt || dur_ms >= LONG_RECORDING_MS )); then notify_user "$(t no_speech)"; fi
     return 0
   fi
 
   job="$RUN_DIR/job-$$.wav"
   mv -f -- "$WAV_FILE" "$job"
-  if have ffmpeg; then
-    if ffmpeg -hide_banner -loglevel error -y -i "$job" -c:a flac "$RUN_DIR/job-$$.flac" 2>>"$LOG_FILE" \
-       && [[ -s $RUN_DIR/job-$$.flac ]]; then
-      rm -f -- "$job"
-      job="$RUN_DIR/job-$$.flac"
-    else
-      log_line "stop: FLAC compression failed, sending WAV"
-      rm -f -- "$RUN_DIR/job-$$.flac"
-    fi
-  fi
+  job=$(compress_audio "$job" "$RUN_DIR/job-$$")
 
   cleanup_session
   set_state transcribing
   log_line "stop: recording ${dur_ms} ms, transcribing"
   release_lock
-  refresh_waybar
+  refresh_bar
   process_job "$job" "$dur_ms"
 }
 
@@ -561,13 +945,54 @@ error_message() {  # RESPONSE_FILE
   printf '%.200s' "$msg"
 }
 
+# Sends JOB to the API. Sets TRANSCRIPT, HTTP_CODE and API_MESSAGE.
+# Returns 0 on HTTP 200, 3 without an API key, 4 on network errors, 5 on API errors.
+transcribe() {  # JOB_FILE
+  local job=$1 resp="$RUN_DIR/resp-$$.txt" rc=0 lang req_start
+  local -a extra=()
+  ensure_dirs
+  TRANSCRIPT=""
+  HTTP_CODE=""
+  API_MESSAGE=""
+
+  resolve_api_key
+  if [[ -z $API_KEY ]]; then return 3; fi
+
+  lang=$(current_language)
+  # --form-string: plain -F would read a file if a value started with @ or <.
+  if [[ $lang != auto ]]; then extra+=(--form-string "language=$lang"); fi
+  if [[ -n $PROMPT ]]; then extra+=(--form-string "prompt=$PROMPT"); fi
+
+  : > "$resp"
+  req_start=$(now_ms)
+  HTTP_CODE=$(curl_with_key "$API_KEY" -sS --max-time 60 -o "$resp" -w '%{http_code}' \
+    -F "file=@$job" --form-string "model=$MODEL" -F response_format=text -F temperature=0 \
+    "${extra[@]}" "$API_BASE_URL/audio/transcriptions" 2>>"$LOG_FILE") || rc=$?
+  API_KEY=""
+
+  if (( rc != 0 )); then
+    log_line "curl failed (exit $rc)"
+    rm -f -- "$resp"
+    return 4
+  fi
+  log_line "transcription http=$HTTP_CODE request_ms=$(( $(now_ms) - req_start ))"
+  if [[ $HTTP_CODE == 200 ]]; then
+    TRANSCRIPT=$(trim "$(cat "$resp")")
+    rm -f -- "$resp"
+    return 0
+  fi
+  API_MESSAGE=$(error_message "$resp")
+  rm -f -- "$resp"
+  return 5
+}
+
 finish_idle() {
   acquire_lock
   if [[ $(read_file "$STATE_FILE") == transcribing ]]; then
     set_state idle
   fi
   release_lock
-  refresh_waybar
+  refresh_bar
 }
 
 fail() {  # MESSAGE - shows an error briefly, then returns to idle
@@ -575,7 +1000,7 @@ fail() {  # MESSAGE - shows an error briefly, then returns to idle
   acquire_lock
   set_state error
   release_lock
-  refresh_waybar
+  refresh_bar
   notify_user -f "$*"
   sleep "$ERROR_HOLD_SECONDS"
   acquire_lock
@@ -583,7 +1008,7 @@ fail() {  # MESSAGE - shows an error briefly, then returns to idle
     set_state idle
   fi
   release_lock
-  refresh_waybar
+  refresh_bar
 }
 
 deliver_text() {  # TEXT - writes to the clipboard and/or types it
@@ -596,17 +1021,17 @@ deliver_text() {  # TEXT - writes to the clipboard and/or types it
   esac
 
   if (( do_type )) && ! have wtype; then
-    notify_user "wtype not found - copying to clipboard instead"
+    notify_user "$(t wtype_missing)"
     do_type=0
     do_clip=1
   fi
   if (( do_clip )) && ! have wl-copy; then
-    notify_user "wl-copy not found - clipboard skipped"
+    notify_user "$(t wlcopy_missing)"
     do_clip=0
     if (( ! do_type )) && have wtype; then do_type=1; fi
   fi
   if (( ! do_type && ! do_clip )); then
-    fail "No output tool found - install wtype and wl-clipboard"
+    fail "$(t err_no_output)"
     return 1
   fi
 
@@ -614,7 +1039,7 @@ deliver_text() {  # TEXT - writes to the clipboard and/or types it
     if printf '%s' "$text" | wl-copy 2>>"$LOG_FILE"; then  # stdin: not in argv
       log_line "text copied to clipboard"
     else
-      notify_user -f "Clipboard copy failed"
+      notify_user -f "$(t clipboard_failed)"
     fi
   fi
   if (( do_type )); then
@@ -623,73 +1048,580 @@ deliver_text() {  # TEXT - writes to the clipboard and/or types it
     if wtype -- "$typed" 2>>"$LOG_FILE"; then
       log_line "text typed"
     else
-      notify_user -f "Typing failed - is a Wayland session running?"
+      notify_user -f "$(t typing_failed)"
     fi
   fi
 }
 
 process_job() {  # JOB_FILE AUDIO_MS
-  local job=$1 audio_ms=$2
-  local resp="$RUN_DIR/resp-$$.txt" req_start code="" rc=0 text msg lang esc
-  local -a extra=()
-
-  resolve_api_key
-  if [[ -z $API_KEY ]]; then
-    fail "No API key - run dictarchy setup"
-    return 1
-  fi
-
-  lang=$(current_language)
-  # --form-string: plain -F would read a file if a value started with @ or <.
-  if [[ $lang != auto ]]; then extra+=(--form-string "language=$lang"); fi
-  if [[ -n $PROMPT ]]; then extra+=(--form-string "prompt=$PROMPT"); fi
-
-  # The key goes to curl via a config on stdin, never via argv.
-  esc=$API_KEY
-  esc=${esc//\\/\\\\}
-  esc=${esc//\"/\\\"}
-
-  : > "$resp"
-  req_start=$(now_ms)
-  code=$(printf 'header = "Authorization: Bearer %s"\n' "$esc" | curl -sS --max-time 60 \
-    -o "$resp" -w '%{http_code}' -K - \
-    -F "file=@$job" --form-string "model=$MODEL" -F response_format=text -F temperature=0 \
-    "${extra[@]}" "$API_BASE_URL/audio/transcriptions" 2>>"$LOG_FILE") || rc=$?
-  esc=""
-  API_KEY=""
-
-  if (( rc != 0 )); then
-    log_line "curl failed (exit $rc)"
-    fail "Network error - API not reachable"
-    return 1
-  fi
-  log_line "transcription http=$code audio_ms=$audio_ms request_ms=$(( $(now_ms) - req_start ))"
-
-  case $code in
-    200)
-      text=$(trim "$(cat "$resp")")
-      if [[ -z $text ]]; then
-        notify_user "Nothing recognized"
-        finish_idle
-        return 0
+  local rc=0
+  log_line "job audio_ms=$2"
+  transcribe "$1" || rc=$?
+  case $rc in
+    0)
+      if [[ -z $TRANSCRIPT ]]; then
+        notify_user "$(t nothing_recognized)"
+      else
+        deliver_text "$TRANSCRIPT"
       fi
-      deliver_text "$text"
+      TRANSCRIPT=""
       finish_idle
       return 0 ;;
-    401|403)
-      fail "Invalid API key - run dictarchy setup"
-      return 1 ;;
-    413)
-      fail "Audio file too large"
-      return 1 ;;
-    429)
-      fail "Rate limited - try again later"
-      return 1 ;;
+    3) fail "$(t err_no_key)" ;;
+    4) fail "$(t err_network)" ;;
     *)
-      msg=$(error_message "$resp")
-      fail "API error $code${msg:+: $msg}"
-      return 1 ;;
+      case $HTTP_CODE in
+        401|403) fail "$(t err_invalid_key)" ;;
+        413) fail "$(t err_too_large)" ;;
+        429) fail "$(t err_rate_limited)" ;;
+        *) fail "$(t err_api "$HTTP_CODE")${API_MESSAGE:+: $API_MESSAGE}" ;;
+      esac ;;
   esac
+  return 1
+}
+
+# ---------------------------------------------------------------------------
+# Hyprland bindings (~/.config/hypr/dictarchy.lua, loaded from hyprland.lua)
+# ---------------------------------------------------------------------------
+lua_string() {  # prints a double-quoted Lua string literal
+  local s=$1
+  s=${s//\\/\\\\}
+  s=${s//\"/\\\"}
+  s=${s//$'\n'/\\n}
+  printf '"%s"' "$s"
+}
+
+write_bindings() {
+  local tmp="$BINDINGS_FILE.tmp.$$" combo opts
+  mkdir -p -- "$HYPR_DIR"
+  {
+    echo "-- Managed by dictarchy - this file is overwritten."
+    echo "-- Change the keys from the dictarchy menu (right-click the bar icon), or edit"
+    echo "-- ~/.config/dictarchy/config and run: dictarchy bindings"
+    echo "-- Loaded by the dictarchy block in ~/.config/hypr/hyprland.lua."
+    echo "if not o then return end"
+    echo ""
+    printf 'local dictarchy = %s\n' "$(lua_string "$(shell_quote "$SELF")")"
+    if [[ -n $PTT_KEY ]]; then
+      combo=$(combo_label "$PTT_MODS" "$PTT_KEY")
+      echo ""
+      echo "-- Push-to-talk: hold to record, release to transcribe."
+      if is_modifier_key "$PTT_KEY"; then
+        echo "-- $PTT_KEY is a modifier: the press is non-consuming, so shortcuts such as"
+        echo "-- Ctrl+C keep working, and short taps are discarded without an API request."
+      fi
+      if is_modifier_key "$PTT_KEY" && [[ -z $PTT_MODS ]]; then
+        opts="{ ignore_mods = true, non_consuming = true }"
+      elif is_modifier_key "$PTT_KEY"; then
+        opts="{ non_consuming = true }"
+      else
+        opts="{}"
+        printf 'pcall(hl.unbind, %s)\n' "$(lua_string "$combo")"
+      fi
+      printf 'o.bind_hold(%s, "Dictarchy: push-to-talk start", dictarchy .. " start --ptt",\n' "$(lua_string "$combo")"
+      printf '  "Dictarchy: push-to-talk stop", dictarchy .. " stop --ptt", %s)\n' "$opts"
+    fi
+    if [[ -n $TOGGLE_KEY ]]; then
+      combo=$(combo_label "$TOGGLE_MODS" "$TOGGLE_KEY")
+      echo ""
+      echo "-- Toggle: press once to start recording, press again to stop."
+      printf 'o.rebind(%s, "Dictarchy: toggle dictation", dictarchy .. " toggle")\n' "$(lua_string "$combo")"
+    fi
+  } > "$tmp"
+  mv -f -- "$tmp" "$BINDINGS_FILE"
+  log_line "bindings written"
+}
+
+reload_hyprland() {  # 0 when Hyprland reloaded without config errors
+  local errors
+  have hyprctl || return 0
+  if ! hyprctl reload >/dev/null 2>&1; then
+    log_line "hyprctl reload failed"
+    return 1
+  fi
+  errors=$(hyprctl configerrors 2>/dev/null || true)
+  errors=$(trim "$errors")
+  if [[ -n $errors ]]; then
+    log_line "hyprland config errors: ${errors//$'\n'/ | }"
+    return 1
+  fi
+  return 0
+}
+
+cmd_bindings() {
+  write_bindings
+  if [[ -t 1 ]]; then echo "Wrote $BINDINGS_FILE"; fi
+  if ! reload_hyprland; then
+    warn "Hyprland reported config errors (see $LOG_FILE and: hyprctl configerrors)"
+    notify_user -f "$(t hypr_errors)"
+    return 1
+  fi
+}
+
+# ---------------------------------------------------------------------------
+# Terminal and menu helpers
+# ---------------------------------------------------------------------------
+# Opens a floating Omarchy terminal (org.omarchy.terminal floats by default).
+open_terminal() {  # TITLE COMMAND...
+  local title=$1
+  shift
+  local -a launcher=()
+  if ! have xdg-terminal-exec; then
+    notify_user -f "$(t err_no_terminal)"
+    return 1
+  fi
+  if have uwsm-app; then launcher=(uwsm-app --); fi
+  log_line "opening terminal: $title"
+  setsid "${launcher[@]}" xdg-terminal-exec --app-id=org.omarchy.terminal --title="$title" \
+    -e "$@" </dev/null >/dev/null 2>&1 9>&- &
+}
+
+wait_for_enter() {
+  local _
+  printf '\n%s' "$(t press_enter)"
+  read -r _ || true
+}
+
+row() {  # ICON LABEL [SUBTEXT] - one omarchy-menu-select row
+  if [[ -n ${3:-} ]]; then
+    printf '%s\t%s\t%s' "$1" "$2" "$3"
+  else
+    printf '%s\t%s' "$1" "$2"
+  fi
+}
+
+MENU_CHOICE=""
+# Shows an Omarchy menu. Rows are "ICON<TAB>LABEL[<TAB>SUBTEXT]". Sets MENU_CHOICE
+# to the label of the chosen row; returns 1 when the menu was dismissed.
+menu_pick() {  # PROMPT ROW...
+  local out
+  MENU_CHOICE=""
+  out=$(omarchy-menu-select "$@" 2>/dev/null) || return 1
+  MENU_CHOICE=${out%%$'\t'*}
+  [[ -n $MENU_CHOICE ]]
+}
+
+menu_input() {  # PROMPT -> prints the text entered; 1 when dismissed
+  local out
+  out=$(omarchy-menu-input "$1" 2>/dev/null) || return 1
+  trim "$out"
+}
+
+mark_current() {  # VALUE CURRENT SUBTEXT -> subtext with "current" appended when equal
+  if [[ $1 == "$2" ]]; then
+    if [[ -n $3 ]]; then printf '%s · ✓ %s' "$3" "$(t menu_current)"; else printf '✓ %s' "$(t menu_current)"; fi
+  else
+    printf '%s' "$3"
+  fi
+}
+
+# Asks before taking a key that Hyprland already uses. 0 = go ahead.
+confirm_combo() {  # MODS KEY ANY_MODS
+  local used label
+  used=$(bind_conflict "$1" "$2" "$3")
+  [[ -z $used ]] && return 0
+  label=$(combo_label "$1" "$2")
+  menu_pick "$(t conflict "$label" "$used")" \
+    "$(row "$ICON_OK" "$(t conflict_use)")" "$(row "$ICON_OFF" "$(t conflict_cancel)")" || return 1
+  [[ $MENU_CHOICE == "$(t conflict_use)" ]]
+}
+
+# ---------------------------------------------------------------------------
+# Settings menu (right-click on the bar icon)
+# ---------------------------------------------------------------------------
+readonly ICON_KEY=$(printf '\xf3\xb0\x8c\x86')       # md-key
+readonly ICON_LANG=$(printf '\xf3\xb0\x97\x8a')      # md-translate
+readonly ICON_MIC=$(printf '\xf3\xb0\x8d\xac')       # md-microphone
+readonly ICON_KEYBOARD=$(printf '\xf3\xb0\x8c\x8c')  # md-keyboard
+readonly ICON_OUTPUT=$(printf '\xf3\xb0\x86\x91')    # md-content_paste
+readonly ICON_TEST=$(printf '\xf3\xb0\x99\xa8')      # md-test_tube
+readonly ICON_LOG=$(printf '\xf3\xb0\x88\x99')       # md-file_document
+readonly ICON_DOT=$(printf '\xf3\xb0\x9d\xa5')       # md-circle_small
+readonly ICON_EDIT=$(printf '\xf3\xb0\x8f\xab')      # md-pencil
+readonly ICON_OFF=$(printf '\xf3\xb0\x85\x96')       # md-close
+readonly ICON_OK=$(printf '\xf3\xb0\x84\xac')        # md-check
+
+key_subtext() {
+  resolve_api_key -q
+  case $API_KEY_SOURCE in
+    file) t menu_key_set ;;
+    env) t menu_key_env ;;
+    *) t menu_key_missing ;;
+  esac
+  API_KEY=""
+}
+
+output_label() {  # MODE
+  t "output_$1"
+}
+
+language_label() {  # CODE
+  if [[ $1 == auto ]]; then t lang_auto; else printf '%s' "${1^^}"; fi
+}
+
+set_language() {  # CODE - sets the active language and adds it to LANGUAGES
+  local code=$1
+  ensure_dirs
+  printf '%s\n' "$code" > "$LANG_FILE"
+  if [[ " $LANGUAGES " != *" $code "* ]]; then
+    config_set LANGUAGES "$LANGUAGES $code"
+  fi
+  log_line "language set to $code"
+  refresh_bar
+  notify_user "$(t language_set "$(language_label "$code")")"
+}
+
+menu_language() {
+  local current code rows=() picked
+  local -a langs=()
+  current=$(current_language)
+  read -r -a langs <<< "$LANGUAGES"
+  for code in "${langs[@]}"; do
+    rows+=("$(row "$ICON_DOT" "$(language_label "$code")" "$(mark_current "$code" "$current" "")")")
+  done
+  rows+=("$(row "$ICON_EDIT" "$(t menu_other)")")
+  menu_pick "$(t menu_language)" "${rows[@]}" || return 1
+  if [[ $MENU_CHOICE == "$(t menu_other)" ]]; then
+    picked=$(menu_input "$(t input_language)") || return 1
+    picked=${picked,,}
+    if [[ ! $picked =~ ^([a-z]{2,3}|auto)$ ]]; then
+      notify_user -f "$(t invalid_language "$picked")"
+      return 1
+    fi
+  else
+    for code in "${langs[@]}"; do
+      if [[ $(language_label "$code") == "$MENU_CHOICE" ]]; then picked=$code; fi
+    done
+  fi
+  [[ -n ${picked:-} ]] || return 1
+  set_language "$picked"
+}
+
+apply_hotkey() {  # ptt|toggle MODS KEY
+  local which=$1 mods=$2 key=$3
+  if [[ $which == ptt ]]; then
+    config_set PTT_MODS "$mods"
+    config_set PTT_KEY "$key"
+  else
+    config_set TOGGLE_MODS "$mods"
+    config_set TOGGLE_KEY "$key"
+  fi
+  cmd_bindings >/dev/null || true
+  refresh_bar
+  local label
+  label=$(combo_label "$mods" "$key")
+  [[ -n $label ]] || label=$(t disabled)
+  if [[ $which == ptt ]]; then notify_user "$(t ptt_set "$label")"; else notify_user "$(t toggle_set "$label")"; fi
+}
+
+menu_hotkey() {  # ptt|toggle
+  local which=$1 title current presets=() rows=() p any text
+  if [[ $which == ptt ]]; then
+    title=$(t menu_ptt)
+    current=$(combo_label "$PTT_MODS" "$PTT_KEY")
+    presets=(Control_L Control_R Alt_R Super_R F9)
+    for p in "${presets[@]}"; do
+      rows+=("$(row "$ICON_MIC" "$p" "$(mark_current "$p" "$current" "$(t "key_$p")")")")
+    done
+  else
+    title=$(t menu_toggle)
+    current=$(combo_label "$TOGGLE_MODS" "$TOGGLE_KEY")
+    presets=("SUPER + ALT + D")
+    rows+=("$(row "$ICON_KEYBOARD" "SUPER + ALT + D" "$(mark_current "SUPER + ALT + D" "$current" "$(t key_toggle_default)")")")
+  fi
+  # A custom combination that is not a preset is listed too, so it shows as current.
+  if [[ -n $current ]] && ! in_list "$current" "${presets[@]}"; then
+    rows+=("$(row "$ICON_KEYBOARD" "$current" "$(mark_current "$current" "$current" "")")")
+  fi
+  rows+=("$(row "$ICON_EDIT" "$(t menu_other)")")
+  rows+=("$(row "$ICON_OFF" "$(t menu_disable)")")
+  menu_pick "$title" "${rows[@]}" || return 1
+
+  case $MENU_CHOICE in
+    "$(t menu_disable)")
+      apply_hotkey "$which" "" ""
+      return 0 ;;
+    "$(t menu_other)")
+      if [[ $which == ptt ]]; then
+        text=$(menu_input "$(t input_ptt)") || return 1
+      else
+        text=$(menu_input "$(t input_toggle)") || return 1
+      fi ;;
+    *) text=$MENU_CHOICE ;;
+  esac
+  if ! parse_combo "$text"; then
+    notify_user -f "$(t invalid_combo "$text")"
+    return 1
+  fi
+  any=0
+  if [[ $which == ptt ]] && is_modifier_key "$COMBO_KEY" && [[ -z $COMBO_MODS ]]; then any=1; fi
+  confirm_combo "$COMBO_MODS" "$COMBO_KEY" "$any" || return 1
+  apply_hotkey "$which" "$COMBO_MODS" "$COMBO_KEY"
+}
+
+menu_output() {
+  local m rows=()
+  for m in both type clipboard; do
+    rows+=("$(row "$ICON_OUTPUT" "$(output_label "$m")" "$(mark_current "$m" "$OUTPUT_MODE" "")")")
+  done
+  menu_pick "$(t menu_output)" "${rows[@]}" || return 1
+  for m in both type clipboard; do
+    if [[ $MENU_CHOICE == "$(output_label "$m")" ]]; then
+      config_set OUTPUT_MODE "$m"
+      refresh_bar
+      notify_user "$(t output_set "$(output_label "$m")")"
+      return 0
+    fi
+  done
+  return 1
+}
+
+cmd_menu() {
+  have omarchy-menu-select || { notify_user -f "$(t err_no_menu)"; die "omarchy-menu-select not found"; }
+  local ptt toggle
+  while :; do
+    ptt=$(combo_label "$PTT_MODS" "$PTT_KEY"); [[ -n $ptt ]] || ptt=$(t disabled)
+    toggle=$(combo_label "$TOGGLE_MODS" "$TOGGLE_KEY"); [[ -n $toggle ]] || toggle=$(t disabled)
+    menu_pick "$(t menu_title)" \
+      "$(row "$ICON_KEY" "$(t menu_api_key)" "$(key_subtext)")" \
+      "$(row "$ICON_LANG" "$(t menu_language)" "$(language_label "$(current_language)")")" \
+      "$(row "$ICON_MIC" "$(t menu_ptt)" "$ptt")" \
+      "$(row "$ICON_KEYBOARD" "$(t menu_toggle)" "$toggle")" \
+      "$(row "$ICON_OUTPUT" "$(t menu_output)" "$(output_label "$OUTPUT_MODE")")" \
+      "$(row "$ICON_TEST" "$(t menu_test)" "$(t menu_test_sub)")" \
+      "$(row "$ICON_LOG" "$(t menu_log)" "${LOG_FILE/#$HOME/\~}")" || return 0
+
+    case $MENU_CHOICE in
+      "$(t menu_api_key)") open_terminal "$(t kp_title)" "$SELF" key; return 0 ;;
+      "$(t menu_test)") open_terminal "$(t t_title)" "$SELF" test; return 0 ;;
+      "$(t menu_log)") cmd_log; return 0 ;;
+      "$(t menu_language)") menu_language && return 0 ;;
+      "$(t menu_ptt)") menu_hotkey ptt && return 0 ;;
+      "$(t menu_toggle)") menu_hotkey toggle && return 0 ;;
+      "$(t menu_output)") menu_output && return 0 ;;
+      *) return 0 ;;
+    esac
+    # A dismissed submenu returns to the main menu.
+  done
+}
+
+# ---------------------------------------------------------------------------
+# API key prompt (only ever in a terminal, input hidden)
+# ---------------------------------------------------------------------------
+cmd_key() {
+  local from_stdin=0 key="" url attempt answer
+  case ${1:-} in
+    --stdin) from_stdin=1 ;;
+    '') ;;
+    *) usage_error "key takes no arguments except --stdin" ;;
+  esac
+
+  if (( from_stdin )); then  # for scripts: one line on stdin, saved without a check
+    IFS= read -r key || true
+    key=$(trim "$key")
+    valid_key_format "$key" || { key=""; die "invalid API key format"; }
+    save_api_key "$key"
+    key=""
+    refresh_bar
+    echo "API key saved to $API_KEY_FILE (permissions 600)."
+    return 0
+  fi
+
+  if [[ ! -t 0 ]]; then  # started from the bar or menu: open a floating terminal
+    open_terminal "$(t kp_title)" "$SELF" key
+    return 0
+  fi
+
+  printf '%s\n\n' "$(t kp_title)"
+  url=$(key_console_url)
+  if [[ -n $url ]]; then printf '%s\n\n' "$(t kp_where "$url")"; fi
+
+  for attempt in 1 2 3; do
+    key=""
+    read -r -s -p "$(t kp_input)" key || true
+    echo
+    key=$(trim "$key")
+    if [[ -z $key ]]; then
+      echo "$(t kp_cancelled)"
+      wait_for_enter
+      return 0
+    fi
+    if ! valid_key_format "$key"; then
+      echo "$(t kp_invalid) $(t kp_retry)"
+      continue
+    fi
+    echo "$(t kp_checking)"
+    if verify_key "$key"; then
+      save_api_key "$key"
+      key=""
+      refresh_bar
+      echo "$(t kp_ok "${API_KEY_FILE/#$HOME/\~}")"
+      notify_user "$(t key_saved)"
+      wait_for_enter
+      return 0
+    fi
+    if [[ $HTTP_CODE == 401 || $HTTP_CODE == 403 ]]; then
+      echo "$(t kp_rejected "$HTTP_CODE") $(t kp_retry)"
+      continue
+    fi
+    echo "$(t kp_unreachable "$HTTP_CODE")"
+    read -r -p "$(t kp_save_anyway)" answer || true
+    if [[ $answer =~ ^[YyJj]$ ]]; then
+      save_api_key "$key"
+      key=""
+      refresh_bar
+      echo "$(t kp_saved_unverified)"
+      notify_user "$(t key_saved)"
+    else
+      key=""
+      echo "$(t kp_cancelled)"
+    fi
+    wait_for_enter
+    return 0
+  done
+  key=""
+  wait_for_enter
+}
+
+# Left-click while "setup needed": ask for the key. Otherwise open the menu.
+cmd_setup() {
+  resolve_api_key -q
+  if [[ -z $API_KEY ]]; then
+    cmd_key
+  else
+    API_KEY=""
+    cmd_menu
+  fi
+}
+
+# ---------------------------------------------------------------------------
+# Test (setup check plus a sample transcription, shown in the terminal only)
+# ---------------------------------------------------------------------------
+check_line() {  # ok|warn|fail LABEL TEXT
+  local mark
+  case $1 in
+    ok) mark=$'\e[32m✓\e[0m' ;;
+    warn) mark=$'\e[33m!\e[0m' ;;
+    *) mark=$'\e[31m✗\e[0m' ;;
+  esac
+  printf '  %s %-20s %s\n' "$mark" "$2" "$3"
+}
+
+bar_has_widget() {
+  local shell_json="$CONFIG_HOME/omarchy/shell.json"
+  have jq && [[ -f $shell_json ]] || return 1
+  jq -e '[.bar.layout[]? | arrays | .[] | select(type == "object" and .id == "io.github.vyrix44.dictarchy")] | length > 0' \
+    "$shell_json" >/dev/null 2>&1
+}
+
+hypr_has_bindings() {
+  have hyprctl && have jq || return 1
+  hyprctl binds -j 2>/dev/null \
+    | jq -e '[.[] | select((.description // "") | startswith("Dictarchy"))] | length > 0' >/dev/null 2>&1
+}
+
+run_test() {
+  local cmd missing=() optional=() wav pid peak rc=0 combos=""
+  printf '%s %s\n\n' "$(t t_title)" "$VERSION"
+
+  for cmd in pw-record wtype wl-copy curl notify-send flock setsid jq; do
+    have "$cmd" || missing+=("$cmd")
+  done
+  have ffmpeg || optional+=(ffmpeg)
+  if (( ${#missing[@]} == 0 )); then
+    check_line ok "$(t t_tools)" "pw-record wtype wl-copy curl notify-send jq"
+  else
+    check_line fail "$(t t_tools)" "$(t t_missing): ${missing[*]}"
+  fi
+  if (( ${#optional[@]} > 0 )); then
+    check_line warn "$(t t_tools)" "$(t t_missing) ($(t t_optional)): ${optional[*]}"
+  fi
+
+  local key_info
+  key_info=$(key_subtext)
+  resolve_api_key
+  if [[ -z $API_KEY ]]; then
+    check_line fail "$(t t_key)" "$(t t_key_none)"
+  else
+    check_line ok "$(t t_key)" "$key_info"
+    if verify_key "$API_KEY"; then
+      check_line ok "$(t t_api)" "$(t t_api_ok "$(api_host)")"
+    elif [[ $HTTP_CODE == 401 || $HTTP_CODE == 403 ]]; then
+      check_line fail "$(t t_api)" "$(t t_api_bad "$(api_host)" "$HTTP_CODE")"
+    else
+      check_line fail "$(t t_api)" "$(t t_api_down "$(api_host)" "$HTTP_CODE")"
+    fi
+  fi
+  API_KEY=""
+
+  [[ -n $PTT_KEY ]] && combos="$(combo_label "$PTT_MODS" "$PTT_KEY")"
+  [[ -n $TOGGLE_KEY ]] && combos="${combos:+$combos, }$(combo_label "$TOGGLE_MODS" "$TOGGLE_KEY")"
+  if hypr_has_bindings; then
+    check_line ok "$(t t_hypr)" "$(t t_hypr_ok "$combos")"
+  else
+    check_line fail "$(t t_hypr)" "$(t t_hypr_missing)"
+  fi
+  if bar_has_widget; then
+    check_line ok "$(t t_bar)" "$(t t_bar_ok)"
+  else
+    check_line warn "$(t t_bar)" "$(t t_bar_missing)"
+  fi
+
+  echo
+  if [[ $(effective_state) != idle ]]; then
+    echo "$(t t_busy)"
+    return 0
+  fi
+  have pw-record || return 0
+  resolve_api_key -q
+  [[ -n $API_KEY ]] || return 0
+  API_KEY=""
+
+  read -r -p "$(t t_record_prompt "$TEST_RECORD_SECONDS")" _ || return 0
+  ensure_dirs
+  wav="$RUN_DIR/test-$$.wav"
+  echo "$(t t_recording)"
+  pid=$(start_recorder "$wav")
+  sleep "$TEST_RECORD_SECONDS"
+  stop_recorder "$pid"
+  if [[ ! -s $wav ]]; then
+    echo "$(t no_audio)"
+    return 0
+  fi
+  peak=$(peak_db "$wav")
+  if [[ -n $peak ]]; then echo "$(t t_peak "$peak")"; fi
+  if is_silent "$wav"; then
+    echo "$(t t_silent)"
+    return 0
+  fi
+  transcribe "$(compress_audio "$wav" "$RUN_DIR/test-$$")" || rc=$?
+  echo
+  if (( rc == 0 )); then
+    echo "$(t t_result)"
+    printf '  %s\n' "${TRANSCRIPT:-…}"
+  else
+    echo "$(t t_failed "${HTTP_CODE:-$rc}${API_MESSAGE:+ - $API_MESSAGE}")"
+  fi
+  TRANSCRIPT=""
+}
+
+cmd_test() {
+  if [[ ! -t 0 ]]; then
+    open_terminal "$(t t_title)" "$SELF" test
+    return 0
+  fi
+  run_test || true
+  wait_for_enter
+}
+
+cmd_log() {
+  ensure_dirs
+  touch "$LOG_FILE"
+  if [[ -t 0 && -t 1 ]]; then
+    tail -n 50 "$LOG_FILE"
+  else
+    open_terminal "dictarchy log" less +G -- "$LOG_FILE"
+  fi
 }
 
 # ---------------------------------------------------------------------------
@@ -728,7 +1660,7 @@ cmd_toggle() {
     recording) do_stop_locked 0 ;;
     transcribing)
       release_lock
-      notify_user "Still transcribing - please wait" ;;
+      notify_user "$(t still_transcribing)" ;;
     *) do_start_locked 0 ;;
   esac
 }
@@ -747,217 +1679,97 @@ cmd_cancel() {
   set_state idle
   release_lock
   log_line "recording cancelled"
-  refresh_waybar
-  notify_user "Recording cancelled"
+  refresh_bar
+  notify_user "$(t cancelled)"
 }
 
 cmd_status() {
-  local st icon cls lang text tooltip
-  st=$(effective_state)
-  if [[ $st == recording && ! -e $SHOWN_FILE ]]; then
-    st=idle  # push-to-talk: stay quiet until the press lasts MIN_DURATION_MS
-  fi
-  case $st in
-    recording) icon=$ICON_MIC ;;
-    transcribing) icon=$ICON_BUSY ;;
-    error) icon=$ICON_MIC_ERROR ;;
-    *) st=idle; icon=$ICON_MIC ;;
+  case ${1:-} in
+    '') status_json ;;
+    --write) refresh_bar; cat "$STATUS_FILE" 2>/dev/null || status_json ;;
+    *) usage_error "status takes no arguments except --write" ;;
   esac
-  cls=$st
-  lang=$(current_language)
-  lang=${lang^^}
-  text="$icon $lang"
-  tooltip="dictarchy: $st\nLanguage: $lang\nPush-to-talk: $(hotkey_label "$PTT_MODS" "$PTT_KEY") (hold)\nToggle: $(hotkey_label "$TOGGLE_MODS" "$TOGGLE_KEY")\nLeft-click: toggle, right-click: next language"
-  printf '{"text":"%s","tooltip":"%s","class":"%s","alt":"%s"}\n' \
-    "$(json_escape "$text")" "$(json_escape "$tooltip")" "$cls" "$cls"
 }
 
 cmd_lang() {
-  local arg=${1:-} current new i idx
+  local arg=${1:-} current new i idx step=1
   local -a langs=()
   current=$(current_language)
   if [[ -z $arg ]]; then
     printf '%s\n' "$current"
     return 0
   fi
-  (( $# == 1 )) || usage_error "lang takes one argument: next or a language code"
+  (( $# == 1 )) || usage_error "lang takes one argument: next, prev or a language code"
 
   case $arg in
-    next)
+    next|prev)
+      if [[ $arg == prev ]]; then step=-1; fi
       read -r -a langs <<< "$LANGUAGES"
       (( ${#langs[@]} > 0 )) || die "LANGUAGES is empty in the config"
       new=${langs[0]}
       for (( i = 0; i < ${#langs[@]}; i++ )); do
         if [[ ${langs[i]} == "$current" ]]; then
-          idx=$(( (i + 1) % ${#langs[@]} ))
+          idx=$(( (i + step + ${#langs[@]}) % ${#langs[@]} ))
           new=${langs[idx]}
           break
         fi
       done
+      ensure_dirs
+      printf '%s\n' "$new" > "$LANG_FILE"
+      log_line "language set to $new"
+      refresh_bar
+      notify_user "$(t language_set "$(language_label "$new")")"
       ;;
     *)
       new=${arg,,}
       [[ $new =~ ^([a-z]{2,3}|auto)$ ]] || usage_error "invalid language code: $arg"
+      set_language "$new"
       ;;
   esac
-
-  ensure_dirs
-  printf '%s\n' "$new" > "$LANG_FILE"
-  log_line "language set to $new"
-  refresh_waybar
-  notify_user "Language: ${new^^}"
   printf '%s\n' "$new"
-}
-
-prompt_value() {  # LABEL CURRENT REGEX -> sets ANSWER; "none" clears, empty keeps
-  local answer
-  read -r -p "$1 [${2:-none}]: " answer || true
-  answer=$(trim "$answer")
-  case $answer in
-    '') ANSWER=$2 ;;
-    none) ANSWER="" ;;
-    *)
-      if [[ $answer =~ $3 ]]; then
-        ANSWER=$answer
-      else
-        die "invalid value: $answer"
-      fi ;;
-  esac
-}
-
-cmd_setup() {
-  local key="" ANSWER=""
-  mkdir -p -m 700 "$CONFIG_DIR"
-  if [[ ! -f $CONFIG_FILE ]]; then write_default_config; fi
-
-  echo "dictarchy setup - press Enter to keep the current value."
-  read -r -s -p "Groq API key (input hidden): " key || true
-  echo
-  key=$(trim "$key")
-  if [[ -n $key ]]; then
-    save_api_key "$key"
-    echo "API key saved to $API_KEY_FILE (permissions 600)."
-  fi
-  key=""
-
-  prompt_value "Push-to-talk key, e.g. Control_L (\"none\" disables)" "$PTT_KEY" '^[A-Za-z0-9_]+$'
-  config_set PTT_KEY "$ANSWER"
-  prompt_value "Push-to-talk modifiers, e.g. SUPER (\"none\" for none)" "$PTT_MODS" '^[A-Za-z_]+( [A-Za-z_]+)*$'
-  config_set PTT_MODS "$ANSWER"
-  prompt_value "Toggle key, e.g. D (\"none\" disables)" "$TOGGLE_KEY" '^[A-Za-z0-9_]+$'
-  config_set TOGGLE_KEY "$ANSWER"
-  prompt_value "Toggle modifiers, e.g. SUPER ALT (\"none\" for none)" "$TOGGLE_MODS" '^[A-Za-z_]+( [A-Za-z_]+)*$'
-  config_set TOGGLE_MODS "$ANSWER"
-
-  load_config
-  echo "Config saved to $CONFIG_FILE."
-  cmd_bindings
-}
-
-cmd_bindings() {
-  local tmp="$BINDINGS_FILE.tmp" extra release_mods
-  mkdir -p -- "$HYPR_DIR"
-  {
-    echo "# managed by dictarchy, edit config instead"
-    echo "# Edit ~/.config/dictarchy/config, then run: dictarchy bindings"
-    if [[ -n $PTT_KEY ]]; then
-      extra=$(modifier_for_key "$PTT_KEY")
-      release_mods=$(merge_mods "$PTT_MODS" "$extra")
-      echo ""
-      echo "# Push-to-talk: hold to record, release to transcribe."
-      echo "# bindn/bindrn are non-consuming, so the key still reaches applications."
-      if [[ -n $extra ]]; then
-        echo "# $PTT_KEY is a modifier key: on release Hyprland reports it in the modifier"
-        echo "# mask, so the release bind adds $extra."
-      fi
-      printf 'bindn = %s, %s, exec, %s start --ptt\n' "$PTT_MODS" "$PTT_KEY" "$SELF"
-      printf 'bindrn = %s, %s, exec, %s stop --ptt\n' "$release_mods" "$PTT_KEY" "$SELF"
-    fi
-    if [[ -n $TOGGLE_KEY ]]; then
-      echo ""
-      echo "# Toggle: press once to start recording, press again to stop."
-      printf 'bindd = %s, %s, Dictarchy toggle dictation, exec, %s toggle\n' \
-        "$TOGGLE_MODS" "$TOGGLE_KEY" "$SELF"
-    fi
-  } > "$tmp"
-  mv -f -- "$tmp" "$BINDINGS_FILE"
-  echo "Wrote $BINDINGS_FILE"
-
-  if have hyprctl; then
-    hyprctl reload >/dev/null 2>&1 || warn "hyprctl reload failed"
-  else
-    echo "hyprctl not found - reload Hyprland manually."
-  fi
-}
-
-cmd_waybar() {
-  # Absolute paths: Waybar does not necessarily have ~/.local/bin on its PATH.
-  cat <<EOF
-// Add "custom/dictarchy" to modules-right in ~/.config/waybar/config.jsonc,
-// then paste this module definition. "signal" must match WAYBAR_SIGNAL.
-"custom/dictarchy": {
-    "exec": "$SELF status",
-    "return-type": "json",
-    "interval": "once",
-    "signal": $WAYBAR_SIGNAL,
-    "on-click": "$SELF toggle",
-    "on-click-right": "$SELF lang next",
-    "tooltip": true
-}
-EOF
-  cat <<'EOF'
-
-/* Paste into ~/.config/waybar/style.css */
-#custom-dictarchy {
-    padding: 0 10px;
-}
-
-#custom-dictarchy.recording {
-    color: #f38ba8;
-}
-
-#custom-dictarchy.transcribing {
-    color: #f9e2af;
-}
-
-#custom-dictarchy.error {
-    color: #fab387;
-}
-EOF
 }
 
 cmd_help() {
   cat <<EOF
-dictarchy $VERSION - speech-to-text via API, triggered by hotkeys
+dictarchy $VERSION - speech-to-text via API for Omarchy, triggered by hotkeys
 
 Usage: dictarchy <command> [options]
 
 Recording:
-  start [--ptt]     start recording (--ptt: push-to-talk, hidden for short taps)
-  stop [--ptt]      stop recording and transcribe the audio
-  toggle            start if idle, stop if recording
-  cancel            stop recording and discard the audio
+  start [--ptt]        start recording (--ptt: push-to-talk, hidden for short taps)
+  stop [--ptt]         stop recording and transcribe the audio
+  toggle               start if idle, stop if recording
+  cancel               stop recording and discard the audio
 
-Information and settings:
-  status            print Waybar JSON (text, tooltip, class, alt)
-  lang [next|CODE]  print the current language, cycle to the next one, or set one
-  bindings          regenerate the Hyprland bindings and reload Hyprland
-  setup             interactive: API key and hotkeys, then regenerate bindings
-  waybar            print the Waybar module and CSS snippets
+Settings:
+  menu                 settings menu (right-click on the bar icon)
+  setup                ask for the API key if missing, else open the menu (left-click
+                       on the bar icon while it shows "setup needed")
+  key [--stdin]        enter the API key in a floating terminal (input hidden);
+                       --stdin reads one line from stdin, for scripts
+  lang [next|prev|CODE]
+                       print the current language, cycle through LANGUAGES, or set one
+  bindings             regenerate ~/.config/hypr/dictarchy.lua and reload Hyprland
 
-  version           print the version
-  help              show this help
+Diagnostics:
+  status [--write]     print the bar status as JSON (--write also updates the file
+                       the bar widget watches)
+  test                 check the setup and transcribe a short sample
+  log                  show the log
+  version | help
 
 Files:
-  config   $CONFIG_FILE
-  api key  $API_KEY_FILE
-  log      $LOG_FILE
+  config    $CONFIG_FILE
+  api key   $API_KEY_FILE
+  bindings  $BINDINGS_FILE
+  log       $LOG_FILE
 EOF
 }
 
 main() {
   local cmd=${1:-help}
   trap cleanup_tmp EXIT
+  detect_ui_lang
   load_config
   if (( $# > 0 )); then shift; fi
 
@@ -966,11 +1778,14 @@ main() {
     stop) cmd_stop "$@" ;;
     toggle) cmd_toggle "$@" ;;
     cancel) cmd_cancel ;;
-    status) cmd_status ;;
+    status) cmd_status "$@" ;;
     lang) cmd_lang "$@" ;;
+    menu) cmd_menu ;;
     setup) cmd_setup ;;
+    key) cmd_key "$@" ;;
     bindings) cmd_bindings ;;
-    waybar) cmd_waybar ;;
+    test) cmd_test ;;
+    log) cmd_log ;;
     version|--version|-V) echo "dictarchy $VERSION" ;;
     help|-h|--help) cmd_help ;;
     _reveal) reveal_session "${1:?session id missing}" ;;  # internal: push-to-talk delay

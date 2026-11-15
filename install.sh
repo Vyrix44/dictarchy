@@ -1,11 +1,17 @@
 #!/usr/bin/env bash
-# install.sh - installs dictarchy for the current user (Omarchy / Hyprland).
+# install.sh - installs dictarchy for the current user on Omarchy 4.5 or newer.
 #
 # Usage: ./install.sh [--link]
 #   --link   symlink ~/.local/bin/dictarchy to this checkout (for development)
 #
-# Nothing is installed system-wide. Missing system packages are installed only
-# after you confirm the exact pacman command shown.
+# What it does (nothing system-wide; missing packages only after you confirm):
+#   1. ~/.local/bin/dictarchy and ~/.config/dictarchy/config (an existing config is kept)
+#   2. the bar widget in ~/.config/omarchy/plugins/io.github.vyrix44.dictarchy/
+#   3. a marked block in ~/.config/hypr/hyprland.lua that loads hypr/dictarchy.lua
+#   4. the widget entry in ~/.config/omarchy/shell.json (bar.layout.right)
+# Every file it edits is backed up first (*.dictarchy-backup-<timestamp>).
+# It does not ask for the API key: the bar icon shows "Setup needed" until you
+# click it and enter the key in a floating terminal.
 set -euo pipefail
 
 SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
@@ -13,14 +19,22 @@ readonly SCRIPT_DIR
 readonly CONFIG_HOME="${XDG_CONFIG_HOME:-$HOME/.config}"
 readonly CONFIG_DIR="$CONFIG_HOME/dictarchy"
 readonly CONFIG_FILE="$CONFIG_DIR/config"
-readonly API_KEY_FILE="$CONFIG_DIR/api_key"
 readonly BIN_DIR="$HOME/.local/bin"
 readonly BIN="$BIN_DIR/dictarchy"
-readonly HYPR_CONF="$CONFIG_HOME/hypr/hyprland.conf"
-readonly MARK_BEGIN="# >>> dictarchy >>>"
-readonly MARK_END="# <<< dictarchy <<<"
+readonly HYPR_DIR="$CONFIG_HOME/hypr"
+readonly HYPR_CONF="$HYPR_DIR/hyprland.lua"
+readonly LEGACY_BINDINGS="$HYPR_DIR/dictarchy.conf"
+readonly PLUGIN_ID="io.github.vyrix44.dictarchy"
+readonly PLUGIN_DIR="$CONFIG_HOME/omarchy/plugins/$PLUGIN_ID"
+readonly SHELL_JSON="$CONFIG_HOME/omarchy/shell.json"
+readonly OMARCHY_ROOT="${OMARCHY_PATH:-/usr/share/omarchy}"
+readonly MARK_BEGIN="-- >>> dictarchy >>>"
+readonly MARK_END="-- <<< dictarchy <<<"
+readonly BAR_BEFORE="omarchy.audio"   # the widget goes left of the volume icon when present
 
 LINK=0
+STAMP=$(date +%Y%m%d-%H%M%S)
+readonly STAMP
 
 info() { printf '==> %s\n' "$*"; }
 warn() { printf 'warning: %s\n' "$*" >&2; }
@@ -36,11 +50,18 @@ ask_yes_no() {  # PROMPT DEFAULT(y|n) -> 0 for yes
   [[ $answer =~ ^[Yy]$ ]]
 }
 
+backup() {  # FILE - copies FILE next to itself, prints the backup path
+  local target="$1.dictarchy-backup-$STAMP"
+  cp -p -- "$1" "$target"
+  printf '%s' "$target"
+}
+
 usage() {
   cat <<'EOF'
 Usage: ./install.sh [--link]
 
   --link   symlink ~/.local/bin/dictarchy to this checkout instead of copying
+           (the bar widget is always copied: the shell refuses symlinked plugins)
 EOF
 }
 
@@ -69,6 +90,20 @@ config_get() {  # KEY DEFAULT
   printf '%s' "$value"
 }
 
+check_omarchy() {
+  local version major
+  info "Checking Omarchy"
+  have omarchy-version || die "omarchy-version not found - dictarchy needs Omarchy 4.5 or newer"
+  version=$(omarchy-version 2>/dev/null || true)
+  major=${version%%.*}
+  if [[ $major =~ ^[0-9]+$ ]] && (( major < 4 )); then
+    die "Omarchy $version found - this version of dictarchy needs Omarchy 4.5 or newer"
+  fi
+  [[ -f $HYPR_CONF ]] || die "$HYPR_CONF not found - dictarchy needs Omarchy's Lua Hyprland config"
+  have omarchy-menu-select || die "omarchy-menu-select not found - dictarchy needs Omarchy 4.5 or newer"
+  echo "  Omarchy ${version:-unknown}"
+}
+
 check_dependencies() {
   local -A pkg_for=(
     [pw-record]=pipewire
@@ -78,14 +113,11 @@ check_dependencies() {
     [notify-send]=libnotify
     [flock]=util-linux
     [setsid]=util-linux
-  )
-  local -A optional_pkg_for=(
-    [ffmpeg]=ffmpeg
     [jq]=jq
   )
-  local cmd missing_pkgs=() missing_opt=() pkg
+  local cmd missing_pkgs=() pkg
   info "Checking dependencies"
-  for cmd in pw-record wtype wl-copy curl notify-send flock setsid; do
+  for cmd in pw-record wtype wl-copy curl notify-send flock setsid jq; do
     if have "$cmd"; then
       printf '  ok       %s\n' "$cmd"
     else
@@ -94,34 +126,23 @@ check_dependencies() {
       if [[ ! " ${missing_pkgs[*]} " == *" $pkg "* ]]; then missing_pkgs+=("$pkg"); fi
     fi
   done
-  for cmd in ffmpeg jq; do
-    if have "$cmd"; then
-      printf '  ok       %s (optional)\n' "$cmd"
-    else
-      printf '  missing  %s (optional)\n' "$cmd"
-      missing_opt+=("${optional_pkg_for[$cmd]}")
-    fi
-  done
+  if have ffmpeg; then
+    printf '  ok       ffmpeg (optional)\n'
+  else
+    printf '  missing  ffmpeg (optional: silence check and smaller uploads)\n'
+  fi
 
   if (( ${#missing_pkgs[@]} > 0 )); then
-    if have pacman; then
-      local cmd_line="sudo pacman -S --needed ${missing_pkgs[*]}"
-      echo
-      echo "Required packages are missing. Command:"
-      echo "  $cmd_line"
-      if ask_yes_no "Run this command now?" n; then
-        # shellcheck disable=SC2086 # package names are plain words from the list above
-        sudo pacman -S --needed ${missing_pkgs[*]} || warn "pacman failed - install the packages manually"
-      else
-        warn "skipped - dictarchy will not work until the packages are installed"
-      fi
+    echo
+    echo "Required packages are missing. Command:"
+    echo "  sudo pacman -S --needed ${missing_pkgs[*]}"
+    if have pacman && ask_yes_no "Run this command now?" n; then
+      # shellcheck disable=SC2086 # package names are plain words from the list above
+      sudo pacman -S --needed ${missing_pkgs[*]} || warn "pacman failed - install the packages manually"
     else
-      warn "install these packages with your package manager: ${missing_pkgs[*]}"
+      warn "skipped - dictarchy will not work until the packages are installed"
     fi
-  fi
-  if (( ${#missing_opt[@]} > 0 )) && have pacman; then
-    echo "Optional (silence check and smaller uploads, JSON error messages):"
-    echo "  sudo pacman -S --needed ${missing_opt[*]}"
+    have jq || die "jq is required to edit ~/.config/omarchy/shell.json"
   fi
 }
 
@@ -132,12 +153,13 @@ install_binary() {
     ln -sfn "$SCRIPT_DIR/bin/dictarchy" "$BIN"
     echo "  symlinked to $SCRIPT_DIR/bin/dictarchy"
   else
+    rm -f -- "$BIN"
     cp -f "$SCRIPT_DIR/bin/dictarchy" "$BIN"
     chmod 755 "$BIN"
   fi
   case ":$PATH:" in
     *":$BIN_DIR:"*) ;;
-    *) warn "$BIN_DIR is not on your PATH - add it, or call $BIN directly" ;;
+    *) warn "$BIN_DIR is not on your PATH - the bar and hotkeys use the absolute path, so this only affects the terminal" ;;
   esac
 }
 
@@ -148,99 +170,161 @@ install_config() {
     echo "  keeping existing $CONFIG_FILE"
   else
     cp "$SCRIPT_DIR/config/config.example" "$CONFIG_FILE"
-    echo "  created $CONFIG_FILE from config/config.example"
+    echo "  created $CONFIG_FILE"
   fi
 }
 
-api_key_present() {
-  [[ -n ${DICTARCHY_API_KEY:-} || -n ${GROQ_API_KEY:-} || -f $API_KEY_FILE ]]
-}
-
-maybe_run_setup() {
-  if api_key_present; then
-    info "API key found - skipping key setup"
-    return 0
-  fi
-  echo
-  if ask_yes_no "No API key found. Run 'dictarchy setup' now (API key and hotkeys)?" y; then
-    "$BIN" setup
-  else
-    echo "  skipped - run '$BIN setup' later"
+install_plugin() {
+  info "Bar widget"
+  mkdir -p "$(dirname "$PLUGIN_DIR")"
+  rm -rf -- "$PLUGIN_DIR"
+  # A real copy: the shell rejects plugins that contain symlinks.
+  cp -r --no-preserve=ownership "$SCRIPT_DIR/plugin" "$PLUGIN_DIR"
+  echo "  copied to $PLUGIN_DIR"
+  if have omarchy-plugin-validate; then
+    omarchy-plugin-validate "$PLUGIN_DIR" >/dev/null || die "the shell would reject the widget (omarchy plugin validate $PLUGIN_DIR)"
   fi
 }
 
-# Warn when the toggle combo is already bound in Hyprland (best effort).
+# Warn when one of the configured hotkeys is already bound in Hyprland.
 check_hypr_conflicts() {
-  local key mods
+  local key mods label mask binds matches
+  have hyprctl || return 0
+  binds=$(hyprctl binds -j 2>/dev/null || true)
+  [[ -n $binds ]] || return 0
   key=$(config_get TOGGLE_KEY D)
   mods=$(config_get TOGGLE_MODS "SUPER ALT")
   [[ -n $key ]] || return 0
-  have hyprctl || return 0
-  local binds
-  binds=$(hyprctl binds -j 2>/dev/null || true)
-  [[ -n $binds ]] || return 0
-  if have jq; then
-    local matches
-    matches=$(jq -r --arg k "$key" \
-      '.[] | select(.key == $k) | "  existing bind: modmask=\(.modmask) dispatcher=\(.dispatcher) arg=\(.arg)"' \
-      <<< "$binds" 2>/dev/null || true)
-    if [[ -n $matches ]]; then
-      warn "key '$key' (combo: $mods) already has Hyprland binds - the toggle may conflict:"
-      printf '%s\n' "$matches" >&2
-    fi
-  elif grep -q "\"key\": *\"$key\"" <<< "$binds"; then
-    warn "a Hyprland bind already uses key '$key' - the toggle combo may conflict (install jq for details)"
+  mask=0
+  [[ " $mods " == *" SHIFT "* ]] && mask=$((mask | 1))
+  [[ " $mods " == *" CTRL "* ]] && mask=$((mask | 4))
+  [[ " $mods " == *" ALT "* ]] && mask=$((mask | 8))
+  [[ " $mods " == *" SUPER "* ]] && mask=$((mask | 64))
+  matches=$(jq -r --arg k "$key" --argjson m "$mask" '
+    .[] | select((.key | ascii_downcase) == ($k | ascii_downcase) and .modmask == $m)
+        | select((.description // "") | startswith("Dictarchy") | not)
+        | "  " + (if (.description // "") != "" then .description else "\(.dispatcher) \(.arg)" end)' \
+    <<< "$binds" 2>/dev/null || true)
+  if [[ -n $matches ]]; then
+    label="${mods// / + } + $key"
+    warn "$label is already bound - dictarchy replaces it. Pick another toggle key from the menu if you need it:"
+    printf '%s\n' "$matches" >&2
   fi
 }
 
-install_hypr_source() {
+install_hypr_block() {
   info "Hyprland configuration"
-  if [[ ! -f $HYPR_CONF ]]; then
-    warn "$HYPR_CONF not found - add this line to your Hyprland config manually:"
-    echo "  source = ~/.config/hypr/dictarchy.conf"
-    return 0
+  if grep -qxF -- "$MARK_BEGIN" "$HYPR_CONF"; then
+    echo "  dictarchy block already present in $HYPR_CONF"
+  else
+    echo "  backup: $(backup "$HYPR_CONF")"
+    {
+      echo ""
+      echo "$MARK_BEGIN"
+      echo "-- Managed by dictarchy (install.sh / uninstall.sh) - do not edit between these markers."
+      echo "-- Loads the hotkeys from ~/.config/hypr/dictarchy.lua when that file exists."
+      echo "do"
+      echo "  local file = io.open(os.getenv(\"HOME\") .. \"/.config/hypr/dictarchy.lua\", \"r\")"
+      echo "  if file then"
+      echo "    file:close()"
+      echo "    require(\"hypr.dictarchy\")"
+      echo "  end"
+      echo "end"
+      echo "$MARK_END"
+    } >> "$HYPR_CONF"
+    echo "  added the dictarchy block to $HYPR_CONF"
   fi
-  if grep -qF "$MARK_BEGIN" "$HYPR_CONF"; then
-    echo "  source line already present in $HYPR_CONF"
-    return 0
+  # Leftover from dictarchy 0.1 (hyprlang bindings, never loaded by a Lua config).
+  if [[ -f $LEGACY_BINDINGS ]] && grep -q '^# managed by dictarchy' "$LEGACY_BINDINGS"; then
+    rm -f -- "$LEGACY_BINDINGS"
+    echo "  removed the old $LEGACY_BINDINGS"
   fi
-  local backup="$HYPR_CONF.dictarchy-backup-$(date +%Y%m%d-%H%M%S)"
-  cp -p "$HYPR_CONF" "$backup"
-  echo "  backup written to $backup"
-  {
-    echo ""
-    echo "$MARK_BEGIN"
-    echo "# Managed by dictarchy - do not edit between these markers."
-    echo "source = ~/.config/hypr/dictarchy.conf"
-    echo "$MARK_END"
-  } >> "$HYPR_CONF"
-  echo "  added source block to $HYPR_CONF"
 }
 
 generate_bindings() {
-  info "Generating Hyprland bindings"
+  info "Hotkeys"
   check_hypr_conflicts
-  "$BIN" bindings
+  if "$BIN" bindings >/dev/null; then
+    "$BIN" status | jq -r '"  push-to-talk: \(if .ptt == "" then "off" else .ptt + " (hold)" end)",
+                           "  toggle:       \(if .toggle == "" then "off" else .toggle end)"'
+    echo "  written to $HYPR_DIR/dictarchy.lua"
+  else
+    warn "Hyprland reported errors after loading the bindings - check: hyprctl configerrors"
+  fi
 }
 
-print_waybar_instructions() {
-  info "Waybar (not edited automatically)"
-  echo "Paste the module and CSS below into your Waybar config (see README.md):"
-  echo
-  "$BIN" waybar
+shell_running() {
+  have omarchy-shell && omarchy-shell shell rescanPlugins >/dev/null 2>&1
+}
+
+widget_in_bar() {
+  [[ -f $SHELL_JSON ]] && jq -e --arg id "$PLUGIN_ID" \
+    '[.bar.layout[]? | arrays | .[] | select(type == "object" and .id == $id)] | length > 0' \
+    "$SHELL_JSON" >/dev/null 2>&1
+}
+
+# Adds {"id": PLUGIN_ID} to bar.layout.right, left of omarchy.audio when present.
+# JSON has no comments, so there are no markers: the entry is found by its id.
+add_widget_with_jq() {
+  local source=$SHELL_JSON tmp
+  if [[ ! -s $source ]]; then source="$OMARCHY_ROOT/config/omarchy/shell.json"; fi
+  [[ -s $source ]] || die "no shell.json found (neither $SHELL_JSON nor $source)"
+  tmp=$(mktemp "$SHELL_JSON.XXXXXX")
+  jq --arg id "$PLUGIN_ID" --arg before "$BAR_BEFORE" '
+    .version = (.version // 1)
+    | .bar = (.bar // {}) | .bar.layout = (.bar.layout // {})
+    | .bar.layout.right = (.bar.layout.right // [])
+    | .bar.layout.right |= (
+        (map(.id) | index($before)) as $i
+        | if $i == null then [{id: $id}] + . else .[:$i] + [{id: $id}] + .[$i:] end)
+  ' "$source" > "$tmp" || { rm -f -- "$tmp"; die "could not update $SHELL_JSON"; }
+  mv -f -- "$tmp" "$SHELL_JSON"
+}
+
+install_bar_entry() {
+  info "Bar entry"
+  mkdir -p "$(dirname "$SHELL_JSON")"
+  if widget_in_bar; then
+    echo "  dictarchy is already in the bar ($SHELL_JSON)"
+    return 0
+  fi
+  if [[ -f $SHELL_JSON ]]; then
+    echo "  backup: $(backup "$SHELL_JSON")"
+  fi
+  local placement=(--section right)
+  if [[ -f $SHELL_JSON ]] && jq -e --arg b "$BAR_BEFORE" '[.bar.layout.right[]?.id] | index($b) != null' \
+       "$SHELL_JSON" >/dev/null 2>&1; then
+    placement+=(--before "$BAR_BEFORE")
+  fi
+  # With the shell running, let it place the widget (it writes shell.json itself).
+  if shell_running && have omarchy-plugin-enable \
+     && omarchy-plugin-enable "$PLUGIN_ID" "${placement[@]}" >/dev/null 2>&1 && widget_in_bar; then
+    echo "  added to the bar (right section) via omarchy plugin enable"
+    return 0
+  fi
+  add_widget_with_jq
+  echo "  added {\"id\": \"$PLUGIN_ID\"} to bar.layout.right in $SHELL_JSON"
+  if have omarchy-shell; then
+    omarchy-shell shell reloadConfig >/dev/null 2>&1 || true
+  fi
 }
 
 main() {
   parse_args "$@"
+  check_omarchy
   check_dependencies
   install_binary
   install_config
-  maybe_run_setup
-  install_hypr_source
+  install_plugin
+  install_hypr_block
   generate_bindings
-  print_waybar_instructions
+  install_bar_entry
+  "$BIN" status --write >/dev/null 2>&1 || true
   echo
-  info "Done. Log file: ${XDG_STATE_HOME:-$HOME/.local/state}/dictarchy/dictarchy.log"
+  info "Done."
+  echo "The dictarchy icon in the bar shows \"Setup needed\" until an API key is saved."
+  echo "Click it to enter your Groq API key (https://console.groq.com/keys) in a"
+  echo "floating terminal. Right-click it for settings, scroll on it to change the language."
 }
 
 main "$@"

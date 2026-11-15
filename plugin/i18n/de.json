@@ -1,0 +1,18 @@
+{
+  "label.setup": "Setup nötig",
+  "state.idle": "dictarchy: bereit",
+  "state.recording": "dictarchy: Aufnahme läuft",
+  "state.transcribing": "dictarchy: wird transkribiert",
+  "state.error": "dictarchy: Fehler",
+  "state.setup": "dictarchy: Einrichtung nötig, noch kein API-Key",
+  "state.missing": "dictarchy: Befehl nicht gefunden (%1)",
+  "info.language": "Sprache: %1",
+  "info.languageAuto": "Sprache: automatisch erkennen",
+  "info.ptt": "Push-to-Talk: %1 (halten)",
+  "info.toggle": "Toggle: %1",
+  "info.off": "aus",
+  "hint.setup": "Linksklick: API-Key eingeben",
+  "hint.toggle": "Linksklick: Diktat starten oder stoppen",
+  "hint.menu": "Rechtsklick: Einstellungen",
+  "hint.scroll": "Scrollen: Sprache wechseln"
+}
