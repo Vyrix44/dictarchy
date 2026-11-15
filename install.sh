@@ -33,6 +33,7 @@ readonly MARK_END="-- <<< dictarchy <<<"
 readonly BAR_BEFORE="omarchy.audio"   # the widget goes left of the volume icon when present
 
 LINK=0
+PLUGIN_FILES_CHANGED=0
 STAMP=$(date +%Y%m%d-%H%M%S)
 readonly STAMP
 
@@ -174,13 +175,26 @@ install_config() {
   fi
 }
 
+plugin_files() {  # DIR - sorted relative file list, empty when DIR is missing
+  [[ -d $1 ]] || return 0
+  (cd "$1" && find . -type f | sort)
+}
+
 install_plugin() {
+  local before after
   info "Bar widget"
+  before=$(plugin_files "$PLUGIN_DIR")
   mkdir -p "$(dirname "$PLUGIN_DIR")"
   rm -rf -- "$PLUGIN_DIR"
   # A real copy: the shell rejects plugins that contain symlinks.
   cp -r --no-preserve=ownership "$SCRIPT_DIR/plugin" "$PLUGIN_DIR"
   echo "  copied to $PLUGIN_DIR"
+  after=$(plugin_files "$PLUGIN_DIR")
+  # The running shell caches the plugin folder's file list: new files (say, a new
+  # Service.qml) fail to load until it restarts. Edits to existing files reload live.
+  if [[ -n $before && $before != "$after" ]]; then
+    PLUGIN_FILES_CHANGED=1
+  fi
   if have omarchy-plugin-validate; then
     omarchy-plugin-validate "$PLUGIN_DIR" >/dev/null || die "the shell would reject the widget (omarchy plugin validate $PLUGIN_DIR)"
   fi
@@ -320,6 +334,10 @@ main() {
   generate_bindings
   install_bar_entry
   "$BIN" status --write >/dev/null 2>&1 || true
+  if (( PLUGIN_FILES_CHANGED )) && shell_running && have omarchy-restart-shell; then
+    info "Restarting the Omarchy shell (the widget gained new files)"
+    omarchy-restart-shell >/dev/null 2>&1 || warn "restart failed - run: omarchy restart shell"
+  fi
   echo
   info "Done."
   echo "The dictarchy icon in the bar shows \"Setup needed\" until an API key is saved."

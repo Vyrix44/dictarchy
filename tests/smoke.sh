@@ -34,7 +34,7 @@ failed() { FAIL=$((FAIL + 1)); echo "  FAIL  $*"; }
 check() {  # DESCRIPTION COMMAND...
   local desc=$1
   shift
-  if "$@"; then pass "$desc"; else failed "$desc"; fi
+  if "$@" >/dev/null; then pass "$desc"; else failed "$desc"; fi
 }
 skip() { echo "  skip  $*"; }
 
@@ -149,7 +149,10 @@ EOF
 # No running shell: the installer must fall back to editing shell.json with jq.
 make_stub omarchy-shell <<'EOF'
 printf '%s\n' "$*" >> "$STUB_LOG/omarchy-shell.log"
-exit 1
+[[ ${STUB_SHELL_UP:-0} == 1 ]]
+EOF
+make_stub omarchy-restart-shell <<'EOF'
+echo restart >> "$STUB_LOG/restart-shell.log"
 EOF
 make_stub omarchy-plugin-validate <<'EOF'
 real=/usr/share/omarchy/bin/omarchy-plugin-validate
@@ -219,16 +222,33 @@ else
   skip "shellcheck not installed"
 fi
 for json in "$REPO/plugin/manifest.json" "$REPO/plugin/i18n/"*.json; do
-  check "valid JSON: ${json#"$REPO/"}" jq -e . "$json" >/dev/null
+  check "valid JSON: ${json#"$REPO/"}" jq -e . "$json"
 done
 check "de.json has every key of en.json" bash -c "diff <(jq -r 'keys[]' '$REPO/plugin/i18n/en.json') <(jq -r 'keys[]' '$REPO/plugin/i18n/de.json') >/dev/null"
 QMLFORMAT=$(command -v qmlformat || echo /usr/lib/qt6/bin/qmlformat)
 if [[ -x $QMLFORMAT ]]; then
-  check "BarWidget.qml parses (qmlformat)" "$QMLFORMAT" "$REPO/plugin/BarWidget.qml" >/dev/null
+  for qml in "$REPO/plugin/"*.qml; do
+    check "$(basename "$qml") parses (qmlformat)" "$QMLFORMAT" "$qml"
+  done
 else
   skip "qmlformat not installed"
 fi
-check "plugin passes omarchy plugin validate" omarchy-plugin-validate "$REPO/plugin" >/dev/null
+check "plugin passes omarchy plugin validate" omarchy-plugin-validate "$REPO/plugin"
+check "manifest declares the overlay service" test "$(jq -c '[.kinds, .entryPoints.service]' "$REPO/plugin/manifest.json")" = '[["bar-widget","service"],"Service.qml"]'
+if command -v node >/dev/null 2>&1; then
+  node -e '
+    const fs = require("fs"); const vm = require("vm");
+    const src = fs.readFileSync(process.argv[1], "utf8").replace(/^\.pragma library\s*$/m, "");
+    const ctx = {}; vm.createContext(ctx); vm.runInContext(src, ctx);
+    const ok = ctx.parse(JSON.stringify({state:"recording",language:"de",ptt:"Control_L",toggle:"SUPER + ALT + D",output:"both",overlay:false}));
+    const bad = [ "not json", JSON.stringify({state:"pwned"}), JSON.stringify({state:"idle",language:"<img src=x>"}) ].map(ctx.parse);
+    if (!ok || ok.state !== "recording" || ok.overlay !== false || ok.language !== "de") process.exit(1);
+    if (bad[0] !== null || bad[1] !== null || bad[2].language !== "") process.exit(2);
+  ' "$REPO/plugin/StatusModel.js"
+  check "StatusModel.js accepts valid status and rejects markup and unknown states" test "$?" = "0"
+else
+  skip "node not installed (StatusModel.js check)"
+fi
 
 # ---------------------------------------------------------------------------
 echo "== config parsing"
@@ -385,6 +405,7 @@ check "status idle is valid JSON" bash -c "$(declare -f json_valid); '$DICT' sta
 check "status lists the push-to-talk key" test "$(field_of_status ptt)" = "Control_L"
 check "status lists the toggle combo" test "$(field_of_status toggle)" = "SUPER + ALT + D"
 check "status lists the language" test "$(field_of_status language)" = "en"
+check "status reports the overlay setting" bash -c "'$DICT' status | grep -q '\"overlay\":true}'"
 "$DICT" toggle
 check "status recording is valid JSON" bash -c "$(declare -f json_valid); '$DICT' status | json_valid"
 check "status recording has state recording" test "$(state_of_status)" = "recording"
@@ -517,7 +538,7 @@ OUTPUT_MODE=both
 EOF
 menu_answers "Output" "Clipboard only"
 "$DICT" menu
-check "menu: main menu lists all seven entries" \
+check "menu: main menu lists all entries" \
   bash -c "head -n1 '$LOGS/menu.log' | grep -q 'API key' && head -n1 '$LOGS/menu.log' | grep -q 'Language' && head -n1 '$LOGS/menu.log' | grep -q 'Push-to-talk key' && head -n1 '$LOGS/menu.log' | grep -q 'Toggle key' && head -n1 '$LOGS/menu.log' | grep -q 'Output' && head -n1 '$LOGS/menu.log' | grep -q 'Test' && head -n1 '$LOGS/menu.log' | grep -q 'Log'"
 check "menu: output set to clipboard" grep -qxF 'OUTPUT_MODE="clipboard"' "$CFG"
 
@@ -549,6 +570,12 @@ menu_answers "Toggle key" "Other..." "SUPER + SHIFT + R" "Cancel"
 "$DICT" menu
 check "menu: conflicting combo asks first" grep -q 'already bound: Screen recording' "$LOGS/menu.log"
 check "menu: cancelling the conflict keeps the old key" bash -c "! grep -q 'TOGGLE_KEY=\"R\"' '$CFG'"
+
+reset_env
+menu_answers "Recording overlay"
+"$DICT" menu
+check "menu: recording overlay can be switched off" grep -qxF 'OVERLAY="false"' "$CFG"
+check "menu: status reports the overlay as off" bash -c "'$DICT' status | grep -q '\"overlay\":false}'"
 
 reset_env
 menu_answers "Toggle key" "Disable"
@@ -638,6 +665,10 @@ check "install: status starts as 'setup'" test "$("$HOME/.local/bin/dictarchy" s
 
 "$REPO/install.sh" </dev/null > "$TMP/install-out2.txt" 2>&1
 check "install again: still exactly one marker block" test "$(grep -cxF -- '-- >>> dictarchy >>>' "$XDG_CONFIG_HOME/hypr/hyprland.lua")" = "1"
+check "install again: no shell restart when the widget files are the same" test ! -e "$LOGS/restart-shell.log"
+rm -f "$PLUGIN_DIR/Service.qml"   # an older install without the overlay service
+STUB_SHELL_UP=1 "$REPO/install.sh" </dev/null >/dev/null 2>&1
+check "upgrade adding widget files restarts the running shell" test -s "$LOGS/restart-shell.log"
 check "install again: still exactly one bar entry" test "$(jq '[.bar.layout[][] | select(.id == "io.github.vyrix44.dictarchy")] | length' "$XDG_CONFIG_HOME/omarchy/shell.json")" = "1"
 
 "$REPO/uninstall.sh" --yes > "$TMP/uninstall-out.txt" 2>&1

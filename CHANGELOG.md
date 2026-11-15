@@ -17,6 +17,11 @@ and the Omarchy menu. Omarchy 3.x (Waybar, Walker, `hyprland.conf`) is no longer
   toggle key, output, test, log), with a confirmation before taking a key Hyprland already uses.
 - `dictarchy key`: API key prompt in a floating terminal with hidden input; the key is checked
   against `$API_BASE_URL/models` before it is saved. `--stdin` for scripts.
+- New mark: five voice bars rising to a peak ("Arch wave"), drawn natively in the bar
+  (`ArchWave.qml`) in the theme color, and used for `assets/icon.svg`.
+- Recording overlay (`Service.qml`): a card at the bottom of the focused monitor with a live
+  microphone waveform while recording and a running wave while transcribing. Click-through,
+  follows the theme; `OVERLAY` setting and a menu entry to turn it off.
 - `dictarchy test`: setup check (tools, key, API, hotkeys, bar entry) and a sample transcription.
 - `dictarchy log`, `dictarchy lang prev`, `dictarchy status --write`.
 - English and German text for menus, prompts, notifications and the widget, following the Omarchy language.
@@ -30,6 +35,7 @@ and the Omarchy menu. Omarchy 3.x (Waybar, Walker, `hyprland.conf`) is no longer
 - Without an API key, hotkeys no longer record: the toggle shows "Setup needed", push-to-talk stays silent.
 - `dictarchy setup` asks for the key when it is missing and opens the menu otherwise.
 - `jq` is now required.
+- `install.sh` restarts the Omarchy shell when an update adds files to the widget.
 - `uninstall.sh` also removes the bar entry and the widget; `--yes` skips the questions.
 
 ### Removed

@@ -4,8 +4,11 @@ import Quickshell.Io
 import qs.Ui
 import qs.Commons
 import qs.Commons as Commons
+import "StatusModel.js" as StatusModel
 
-// dictarchy bar icon.
+// dictarchy bar icon (the Arch wave mark, see ArchWave.qml).
+//   red while recording or after an error, pulsing while transcribing,
+//   dimmed while setup is needed
 //   left-click   start/stop dictation, or enter the API key while setup is needed
 //   right-click  settings menu (API key, language, keys, output, test, log)
 //   scroll       next/previous language
@@ -30,13 +33,6 @@ BarWidget {
   property string toggle: ""
   property bool missing: false
 
-  readonly property var knownStates: ["idle", "recording", "transcribing", "error", "setup"]
-
-  readonly property string icon: {
-    if (missing || status === "error" || status === "setup") return "󰍭"
-    if (status === "transcribing") return "󰔟"
-    return "󰍬"
-  }
 
   readonly property string label: {
     if (vertical) return ""
@@ -44,16 +40,23 @@ BarWidget {
     return language === "" ? "" : language.toUpperCase()
   }
 
+  // Fills %1 only once the catalog has loaded; before that t() returns the
+  // bare key, and QString::arg would warn about the missing placeholder.
+  function fill(key, value) {
+    var text = strings.t(key)
+    return text.indexOf("%1") !== -1 ? text.arg(value) : text
+  }
+
   readonly property string tooltip: {
-    if (missing) return strings.t("state.missing").arg(command)
+    if (missing) return fill("state.missing", command)
     var lines = [strings.t("state." + status)]
     if (status === "setup") {
       lines.push("", strings.t("hint.setup"), strings.t("hint.menu"))
       return lines.join("\n")
     }
-    lines.push(language === "auto" ? strings.t("info.languageAuto") : strings.t("info.language").arg(language.toUpperCase()))
-    lines.push(strings.t("info.ptt").arg(ptt !== "" ? ptt : strings.t("info.off")))
-    lines.push(strings.t("info.toggle").arg(toggle !== "" ? toggle : strings.t("info.off")))
+    lines.push(language === "auto" ? strings.t("info.languageAuto") : fill("info.language", language.toUpperCase()))
+    lines.push(fill("info.ptt", ptt !== "" ? ptt : strings.t("info.off")))
+    lines.push(fill("info.toggle", toggle !== "" ? toggle : strings.t("info.off")))
     lines.push("", strings.t("hint.toggle"), strings.t("hint.menu"), strings.t("hint.scroll"))
     return lines.join("\n")
   }
@@ -63,27 +66,14 @@ BarWidget {
 
   Commons.Translations { id: strings; directory: Qt.resolvedUrl("i18n") }
 
-  // The status is produced by our own CLI, but it is still parsed defensively:
-  // only known states and short, plain values are taken over.
-  function boundedString(value, pattern) {
-    if (typeof value !== "string" || value.length > 64) return ""
-    return pattern.test(value) ? value : ""
-  }
-
   function apply(raw) {
-    var data
-    try {
-      data = JSON.parse(String(raw || "").trim())
-    } catch (e) {
-      return
-    }
-    if (!data || typeof data !== "object") return
-    if (knownStates.indexOf(data.state) === -1) return
+    var data = StatusModel.parse(raw)
+    if (!data) return
     missing = false
     status = data.state
-    language = boundedString(data.language, /^([a-z]{2,3}|auto)$/)
-    ptt = boundedString(data.ptt, /^[A-Za-z0-9_ +]*$/)
-    toggle = boundedString(data.toggle, /^[A-Za-z0-9_ +]*$/)
+    language = data.language
+    ptt = data.ptt
+    toggle = data.toggle
   }
 
   function run(args) {
@@ -140,13 +130,23 @@ BarWidget {
     id: button
     anchors.fill: parent
     bar: root.bar
-    text: root.icon
     labelText: root.label
     slotSize: root.label === "" ? Style.bar.iconSlot
       : Style.bar.iconSlot + labelMetrics.advanceWidth + Style.space(4)
     active: root.status === "recording" || root.status === "error"
     dimmed: root.status === "setup" || root.missing
     tooltipText: root.tooltip
+    iconComponent: Component {
+      Item {
+        ArchWave {
+          x: (parent.width - width) / 2
+          y: (parent.height - height) / 2
+          iconSize: button.iconSize
+          color: button.active ? button.activeColor : button.foreground
+          busy: root.status === "transcribing"
+        }
+      }
+    }
     onPressed: function(b) {
       if (b === Qt.RightButton) root.run("menu")
       else if (b === Qt.LeftButton) root.run(root.status === "setup" ? "setup" : "toggle")
