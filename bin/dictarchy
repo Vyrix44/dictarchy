@@ -3,7 +3,7 @@
 # config, Omarchy shell bar, Omarchy menu). Run "dictarchy help" for an overview.
 set -euo pipefail
 
-readonly VERSION="0.2.0"
+readonly VERSION="0.3.0"
 readonly SELF="$(readlink -f -- "${BASH_SOURCE[0]}")"
 
 # ---------------------------------------------------------------------------
@@ -18,6 +18,11 @@ readonly CONFIG_FILE="$CONFIG_DIR/config"
 readonly API_KEY_FILE="$CONFIG_DIR/api_key"
 readonly HYPR_DIR="$CONFIG_HOME/hypr"
 readonly BINDINGS_FILE="$HYPR_DIR/dictarchy.lua"
+readonly HYPR_CONF="$HYPR_DIR/hyprland.lua"
+readonly HYPR_MARK_BEGIN="-- >>> dictarchy >>>"   # the block install.sh adds to hyprland.lua
+# install.sh sits next to bin/ in the plugin folder (omarchy plugin add clones the
+# whole repository there). It finishes the setup the plugin manager cannot do.
+readonly INSTALLER="${SELF%/bin/*}/install.sh"
 readonly OMARCHY_LANGUAGE_FILE="$CONFIG_HOME/omarchy/language"
 
 readonly STATE_DIR="$STATE_HOME/dictarchy"
@@ -161,6 +166,7 @@ declare -A MSG_EN=(
   [kp_invalid]="That does not look like an API key (8-512 characters, no spaces)."
   [kp_retry]="Try again."
   [press_enter]="Press Enter to close."
+  [setup_title]="dictarchy - setup"
 
   [t_title]="dictarchy test"
   [t_tools]="Tools"
@@ -269,6 +275,7 @@ declare -A MSG_DE=(
   [kp_invalid]="Das sieht nicht nach einem API-Key aus (8–512 Zeichen, keine Leerzeichen)."
   [kp_retry]="Bitte nochmal."
   [press_enter]="Enter zum Schließen."
+  [setup_title]="dictarchy – Einrichtung"
 
   [t_title]="dictarchy-Test"
   [t_tools]="Werkzeuge"
@@ -704,7 +711,7 @@ status_json() {
   fi
   if [[ $st == idle ]]; then
     resolve_api_key -q
-    if [[ -z $API_KEY ]]; then st=setup; fi
+    if [[ -z $API_KEY ]] || integration_missing; then st=setup; fi
     API_KEY=""
   fi
   printf '{"state":"%s","language":"%s","ptt":"%s","toggle":"%s","output":"%s","overlay":%s}\n' \
@@ -1117,6 +1124,12 @@ write_bindings() {
     echo "-- Loaded by the dictarchy block in ~/.config/hypr/hyprland.lua."
     echo "if not o then return end"
     echo ""
+    echo "-- No binds once the command is gone (say, the plugin was removed with"
+    echo "-- \"omarchy plugin remove\" instead of uninstall.sh)."
+    printf 'local command = io.open(%s, "r")\n' "$(lua_string "$SELF")"
+    echo "if not command then return end"
+    echo "command:close()"
+    echo ""
     printf 'local dictarchy = %s\n' "$(lua_string "$(shell_quote "$SELF")")"
     if [[ -n $PTT_KEY ]]; then
       combo=$(combo_label "$PTT_MODS" "$PTT_KEY")
@@ -1508,8 +1521,25 @@ cmd_key() {
   wait_for_enter
 }
 
-# Left-click while "setup needed": ask for the key. Otherwise open the menu.
+# True when Omarchy's hyprland.lua exists but does not load the dictarchy hotkeys
+# yet, which is the case right after "omarchy plugin add": the plugin manager only
+# clones the plugin and enables the widget.
+integration_missing() {
+  [[ -f $HYPR_CONF ]] && ! grep -qxF -- "$HYPR_MARK_BEGIN" "$HYPR_CONF" 2>/dev/null
+}
+
+# Left-click while "setup needed": run install.sh --setup in a floating terminal
+# when the hotkeys are not set up yet (it asks for the API key at the end), else
+# ask for the key. Otherwise open the menu.
 cmd_setup() {
+  if integration_missing && [[ -x $INSTALLER ]]; then
+    if [[ -t 0 ]]; then
+      "$INSTALLER" --setup
+    else
+      open_terminal "$(t setup_title)" "$INSTALLER" --setup
+    fi
+    return 0
+  fi
   resolve_api_key -q
   if [[ -z $API_KEY ]]; then
     cmd_key
@@ -1768,8 +1798,9 @@ Recording:
 
 Settings:
   menu                 settings menu (right-click on the bar icon)
-  setup                ask for the API key if missing, else open the menu (left-click
-                       on the bar icon while it shows "setup needed")
+  setup                finish the setup if needed (hotkeys via install.sh --setup,
+                       then the API key), else open the menu (left-click on the
+                       bar icon while it shows "setup needed")
   key [--stdin]        enter the API key in a floating terminal (input hidden);
                        --stdin reads one line from stdin, for scripts
   lang [next|prev|CODE]

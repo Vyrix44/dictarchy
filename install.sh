@@ -1,17 +1,25 @@
 #!/usr/bin/env bash
 # install.sh - installs dictarchy for the current user on Omarchy 4.5 or newer.
 #
-# Usage: ./install.sh [--link]
+# Usage: ./install.sh [--link] [--setup]
 #   --link   symlink ~/.local/bin/dictarchy to this checkout (for development)
+#   --setup  ask for the API key at the end when none is saved yet; used when the
+#            bar icon is clicked after "omarchy plugin add"
+#
+# The repository is the plugin folder. "omarchy plugin add" clones it to
+# ~/.config/omarchy/plugins/io.github.vyrix44.dictarchy/ and enables the widget;
+# this script, run from there, does the rest. Run from any other checkout, it
+# copies the plugin there first.
 #
 # What it does (nothing system-wide; missing packages only after you confirm):
-#   1. ~/.local/bin/dictarchy and ~/.config/dictarchy/config (an existing config is kept)
-#   2. the bar widget in ~/.config/omarchy/plugins/io.github.vyrix44.dictarchy/
+#   1. the plugin in ~/.config/omarchy/plugins/io.github.vyrix44.dictarchy/
+#   2. ~/.local/bin/dictarchy (a symlink to the plugin's bin/dictarchy) and
+#      ~/.config/dictarchy/config (an existing config is kept)
 #   3. a marked block in ~/.config/hypr/hyprland.lua that loads hypr/dictarchy.lua
 #   4. the widget entry in ~/.config/omarchy/shell.json (bar.layout.right)
 # Every file it edits is backed up first (*.dictarchy-backup-<timestamp>).
-# It does not ask for the API key: the bar icon shows "Setup needed" until you
-# click it and enter the key in a floating terminal.
+# Without --setup it does not ask for the API key: the bar icon shows "Setup
+# needed" until you click it and enter the key in a floating terminal.
 set -euo pipefail
 
 SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
@@ -32,7 +40,14 @@ readonly MARK_BEGIN="-- >>> dictarchy >>>"
 readonly MARK_END="-- <<< dictarchy <<<"
 readonly BAR_BEFORE="omarchy.audio"   # the widget goes left of the volume icon when present
 
+# What a plugin folder needs; the tests and the git metadata stay in the checkout.
+readonly -a PLUGIN_FILES=(
+  manifest.json BarWidget.qml Service.qml ArchWave.qml StatusModel.js i18n
+  bin config assets install.sh uninstall.sh README.md CHANGELOG.md LICENSE
+)
+
 LINK=0
+SETUP=0
 PLUGIN_FILES_CHANGED=0
 STAMP=$(date +%Y%m%d-%H%M%S)
 readonly STAMP
@@ -59,10 +74,11 @@ backup() {  # FILE - copies FILE next to itself, prints the backup path
 
 usage() {
   cat <<'EOF'
-Usage: ./install.sh [--link]
+Usage: ./install.sh [--link] [--setup]
 
-  --link   symlink ~/.local/bin/dictarchy to this checkout instead of copying
-           (the bar widget is always copied: the shell refuses symlinked plugins)
+  --link   symlink ~/.local/bin/dictarchy to this checkout instead of the plugin
+           folder (the plugin itself is always copied: the shell refuses symlinks)
+  --setup  ask for the API key at the end when none is saved yet
 EOF
 }
 
@@ -71,6 +87,7 @@ parse_args() {
   for arg in "$@"; do
     case $arg in
       --link) LINK=1 ;;
+      --setup) SETUP=1 ;;
       -h|--help) usage; exit 0 ;;
       *) die "unknown option: $arg (see --help)" ;;
     esac
@@ -148,16 +165,14 @@ check_dependencies() {
 }
 
 install_binary() {
-  info "Installing dictarchy to $BIN"
+  local target="$PLUGIN_DIR/bin/dictarchy"
+  if (( LINK )); then target="$SCRIPT_DIR/bin/dictarchy"; fi
+  info "Linking $BIN"
   mkdir -p "$BIN_DIR"
-  if (( LINK )); then
-    ln -sfn "$SCRIPT_DIR/bin/dictarchy" "$BIN"
-    echo "  symlinked to $SCRIPT_DIR/bin/dictarchy"
-  else
-    rm -f -- "$BIN"
-    cp -f "$SCRIPT_DIR/bin/dictarchy" "$BIN"
-    chmod 755 "$BIN"
-  fi
+  # A symlink, so "omarchy plugin update" updates the command as well.
+  rm -f -- "$BIN"
+  ln -s -- "$target" "$BIN"
+  echo "  -> $target"
   case ":$PATH:" in
     *":$BIN_DIR:"*) ;;
     *) warn "$BIN_DIR is not on your PATH - the bar and hotkeys use the absolute path, so this only affects the terminal" ;;
@@ -180,14 +195,31 @@ plugin_files() {  # DIR - sorted relative file list, empty when DIR is missing
   (cd "$1" && find . -type f | sort)
 }
 
+running_from_plugin_dir() {
+  [[ -d $PLUGIN_DIR && $SCRIPT_DIR -ef $PLUGIN_DIR ]]
+}
+
 install_plugin() {
-  local before after
-  info "Bar widget"
+  local before after f
+  info "Plugin"
+  if running_from_plugin_dir; then
+    echo "  using $PLUGIN_DIR (installed with omarchy plugin add)"
+    return 0
+  fi
+  if [[ -d $PLUGIN_DIR/.git ]]; then
+    # Copying over it would drop the git checkout that "omarchy plugin update" pulls.
+    echo "  $PLUGIN_DIR is managed by omarchy plugin - keeping it"
+    echo "  (update it with: omarchy plugin update $PLUGIN_ID)"
+    return 0
+  fi
   before=$(plugin_files "$PLUGIN_DIR")
   mkdir -p "$(dirname "$PLUGIN_DIR")"
   rm -rf -- "$PLUGIN_DIR"
+  mkdir -p -- "$PLUGIN_DIR"
   # A real copy: the shell rejects plugins that contain symlinks.
-  cp -r --no-preserve=ownership "$SCRIPT_DIR/plugin" "$PLUGIN_DIR"
+  for f in "${PLUGIN_FILES[@]}"; do
+    cp -r --no-preserve=ownership -- "$SCRIPT_DIR/$f" "$PLUGIN_DIR/"
+  done
   echo "  copied to $PLUGIN_DIR"
   after=$(plugin_files "$PLUGIN_DIR")
   # The running shell caches the plugin folder's file list: new files (say, a new
@@ -325,11 +357,15 @@ install_bar_entry() {
 
 main() {
   parse_args "$@"
+  if (( SETUP )) && [[ -t 0 ]]; then
+    # The floating terminal closes when this script ends: keep an error readable.
+    trap 'rc=$?; if (( rc != 0 )); then read -r -p "Setup failed. Press Enter to close. " _ || true; fi' EXIT
+  fi
   check_omarchy
   check_dependencies
+  install_plugin
   install_binary
   install_config
-  install_plugin
   install_hypr_block
   generate_bindings
   install_bar_entry
@@ -340,9 +376,29 @@ main() {
   fi
   echo
   info "Done."
+  if (( SETUP )); then
+    finish_setup
+    return 0
+  fi
   echo "The dictarchy icon in the bar shows \"Setup needed\" until an API key is saved."
   echo "Click it to enter your Groq API key (https://console.groq.com/keys) in a"
   echo "floating terminal. Right-click it for settings, scroll on it to change the language."
+}
+
+# --setup: the terminal the bar icon opened. Ask for the key right here when none
+# is saved yet ("dictarchy key" waits for Enter itself), otherwise wait for Enter.
+finish_setup() {
+  local status
+  status=$("$BIN" status --write 2>/dev/null || true)
+  if [[ -t 0 ]] && jq -e '.state == "setup"' <<< "$status" >/dev/null 2>&1; then
+    echo
+    "$BIN" key
+    return 0
+  fi
+  echo "Right-click the dictarchy icon for settings, scroll on it to change the language."
+  if [[ -t 0 ]]; then
+    read -r -p "Press Enter to close. " _ || true
+  fi
 }
 
 main "$@"
