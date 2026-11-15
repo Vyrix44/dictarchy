@@ -363,10 +363,22 @@ EOF
 "$DICT" start --ptt
 check "ptt start: status hidden during the delay" test "$(state_of_status)" = "idle"
 sleep 0.8
-check "ptt hold: 'Recording' notification shown" grep -q Recording "$LOGS/notify.log"
+check "ptt hold: no 'Recording' notification (the overlay shows it)" bash -c "! grep -q Recording '$LOGS/notify.log' 2>/dev/null"
 check "ptt hold: status shows recording" test "$(state_of_status)" = "recording"
 "$DICT" stop --ptt
 check "ptt hold: transcript typed" grep -qxF 'hello world ' "$LOGS/wtype.log"
+
+reset_env
+write_config <<'EOF'
+MIN_DURATION_MS=300
+OVERLAY="false"
+EOF
+"$DICT" start --ptt; sleep 0.8
+check "overlay off: ptt hold shows the 'Recording' notification instead" grep -q Recording "$LOGS/notify.log"
+"$DICT" cancel >/dev/null
+rm -f "$LOGS/notify.log"
+"$DICT" toggle; "$DICT" cancel >/dev/null
+check "overlay off: toggle shows the 'Recording' notification" grep -q Recording "$LOGS/notify.log"
 
 # ---------------------------------------------------------------------------
 echo "== language cycling (scroll) and auto"

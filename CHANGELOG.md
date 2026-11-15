@@ -21,7 +21,8 @@ and the Omarchy menu. Omarchy 3.x (Waybar, Walker, `hyprland.conf`) is no longer
   (`ArchWave.qml`) in the theme color, and used for `assets/icon.svg`.
 - Recording overlay (`Service.qml`): a card at the bottom of the focused monitor with a live
   microphone waveform while recording and a running wave while transcribing. Click-through,
-  follows the theme; `OVERLAY` setting and a menu entry to turn it off.
+  follows the theme; `OVERLAY` setting and a menu entry to turn it off. It replaces the
+  "Recording..." notification, which now only appears while the overlay is off.
 - `dictarchy test`: setup check (tools, key, API, hotkeys, bar entry) and a sample transcription.
 - `dictarchy log`, `dictarchy lang prev`, `dictarchy status --write`.
 - English and German text for menus, prompts, notifications and the widget, following the Omarchy language.

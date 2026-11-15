@@ -836,16 +836,22 @@ do_start_locked() {  # PTT_FLAG
       ( sleep "$secs"; "$SELF" _reveal "$sid" ) </dev/null >/dev/null 2>&1 9>&- &
     fi
   else
-    notify_user "$(t recording)"
+    notify_recording
     refresh_bar
   fi
+}
+
+# The overlay at the bottom of the screen shows recording; the notification is
+# only the fallback when the overlay is turned off.
+notify_recording() {
+  if [[ $OVERLAY != true ]]; then notify_user "$(t recording)"; fi
 }
 
 reveal_session() {  # SESSION_ID - used by the push-to-talk delay
   acquire_lock
   if [[ $(effective_state) == recording && $(read_file "$SESSION_FILE") == "$1" && ! -e $SHOWN_FILE ]]; then
     touch "$SHOWN_FILE"
-    notify_user "$(t recording)"
+    notify_recording
     refresh_bar
   fi
   release_lock

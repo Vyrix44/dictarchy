@@ -110,7 +110,7 @@ Omarchy's own dictation (when a backend is selected) uses Alt+Space and Right Al
 
 | Action       | Default        | Behavior |
 |--------------|----------------|----------|
-| Push-to-talk | hold Left Ctrl | Records while held, transcribes on release. Shows "Recording..." only after `MIN_DURATION_MS`. |
+| Push-to-talk | hold Left Ctrl | Records while held, transcribes on release. The overlay appears only after `MIN_DURATION_MS`. |
 | Toggle       | Super+Alt+D    | Press to start, press again to stop and transcribe. |
 
 The bindings are generated into `~/.config/hypr/dictarchy.lua` with Omarchy's `o.bind_hold` and
@@ -163,7 +163,8 @@ the theme's accent color; the card disappears when the text arrives. Push-to-tal
 `MIN_DURATION_MS` never show it. The card follows the Omarchy theme (colors, border, corner rounding) and lets
 every click through. The level comes from the default PipeWire source; a virtual source shows a flat line.
 
-Turn it off with *Recording overlay* in the menu or `OVERLAY="false"` in the config.
+Turn it off with *Recording overlay* in the menu or `OVERLAY="false"` in the config. With the overlay off,
+a "Recording..." notification marks the start of a recording instead.
 
 ## How the widget gets its state
 
